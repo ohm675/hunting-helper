@@ -91,6 +91,9 @@ local function saveStatus()
             GameAutoSkill = player:GetAttribute("AutoSkill"), GameAutoSkillError = state.GameAutoSkillError,
             FarmSpot = state.FarmSpot,
             TravelWalk = state.TravelWalk,
+            StatStatus = state.StatStatus, StatCost = state.StatCost,
+            LastTravel = state.LastTravel,
+            GearKeepStatus=state.GearKeepStatus,GearProtectedCount=state.GearProtectedCount,
         }))
     end)
 end
@@ -199,26 +202,53 @@ local walkBeforeWarp=assert(loadstring(readfile("hunting-travel-walk.lua")))()({
 })
 local function moveTo(point, token)
     check(token)
+    local following=type(point)=="function"
+    local destination=following and point or function() return point end
+    local target=destination()
+    if not target then return false end
+    state.LastTravel={Target=tostring(target),Follow=following,Outcome="preparing"}
     setAuto(false)
     sleep(0.35, token)
     local c, h, r = character()
     if not c then return false end
     h.Sit=false
-    if not walkBeforeWarp(point,token) then return false end
+    if not walkBeforeWarp(target,token) then return false end
     check(token)
     c,h,r=character()
     if not c then return false end
+    -- Walking may take several seconds. A party leader can enter/leave a room
+    -- in that time, so resolve a follower destination again immediately before travel.
+    target=destination()
+    if not target then state.LastTravel.Outcome="waiting for leader"; return false end
+    state.LastTravel.Target=tostring(target)
+    local movedAt=os.clock()
     h:Move(Vector3.zero, false)
     h.Sit = false
-    c:PivotTo(CFrame.new(point))
+    c:PivotTo(CFrame.new(target))
     r.AssemblyLinearVelocity = Vector3.zero
     r.AssemblyAngularVelocity = Vector3.zero
     sleep(1.5, token)
     local _, _, current = character()
     if not current then return false end
-    local delta = current.Position-point
-    assert(Vector2.new(delta.X, delta.Z).Magnitude <= 25 and math.abs(delta.Y) < 45,
-        "Travel was rejected; paused")
+    local delta = current.Position-target
+    state.LastTravel.After=tostring(current.Position)
+    local arrived=Vector2.new(delta.X, delta.Z).Magnitude<=25 and math.abs(delta.Y)<45
+    if not arrived and (state.LastDodgeAt or -math.huge)>=movedAt then
+        -- A warning can move the character to a safe point during the arrival
+        -- check. A confirmed dodge inside the destination room is valid arrival.
+        for id,z in pairs(nav().Zones or {}) do
+            if math.abs(target.X-z.X)<=z.SX/2 and math.abs(target.Z-z.Z)<=z.SZ/2
+                and math.abs(target.Y-z.Y)<45 and inZone(current,{Id=id}) then arrived=true; break end
+        end
+    end
+    state.LastTravel.Outcome=arrived and "arrived" or "regroup needed"
+    if not arrived and following then
+        state.Zone=nil
+        status("Waiting to regroup with party leader")
+        sleep(1,token)
+        return false
+    end
+    assert(arrived,"Travel was rejected; paused")
     return true
 end
 local function prepareFarm(zone, token)
@@ -284,7 +314,8 @@ local function saleCandidates()
     for id in pairs(gears) do
         if not equipped[id] and not locked[id] then
             local ok, item = pcall(GearUtil.Resolve, id, gears)
-            if ok and item and (item.Kind == "weapon" or item.Kind == "armor") and (item.Sell or 0) > 0 then
+            if ok and item and (item.Kind == "weapon" or item.Kind == "armor") and (item.Sell or 0) > 0
+                and (not state.GearDecision or state.GearDecision(item)=="sell") then
                 list[#list+1] = {id, 1}
             end
         end
@@ -292,7 +323,8 @@ local function saleCandidates()
     for id, count in pairs(json("ItemsJson")) do
         local item = ItemData[id]
         if type(count) == "number" and type(item) == "table" and not locked[id]
-            and (item.Kind == "weapon" or item.Kind == "armor") and (item.Sell or 0) > 0 then
+            and (item.Kind == "weapon" or item.Kind == "armor") and (item.Sell or 0) > 0
+            and (not state.GearDecision or state.GearDecision(item)=="sell") then
             local amount = math.floor(count - (equipped[id] or 0))
             if amount > 0 then list[#list+1] = {id, amount} end
         end
@@ -316,15 +348,19 @@ local function sellEquipment(token)
         merchant = {X=point.X, Y=point.Y, Z=point.Z}
     end
     local target = Vector3.new(merchant.X+5, merchant.Y+2, merchant.Z+3)
-    if not moveTo(target, token) then return end
+    if not moveTo(target, token) then return false end
     local shop = player:FindFirstChild("HuntShop")
     if shop then shop:Fire("sell") end
     sleep(0.6, token)
     equipBest(token)
+    if state.EnsureGearLocks and not state.EnsureGearLocks(token) then
+        status("Waiting for protected gear locks before selling")
+        return false
+    end
     local total = 0
     for _ = 1, 100 do
         check(token)
-        if not character() then return end
+        if not character() then return false end
         local list = saleCandidates() -- Always re-read locks and equipped items.
         if #list == 0 then break end
         local entry = list[1]
@@ -357,6 +393,7 @@ local function sellEquipment(token)
     local maximum = tonumber(player:GetAttribute("BagSlotsMax")) or 120
     assert(used < maximum - CONFIG.ReservedSlots and used/maximum*100 < CONFIG.SellAtPercent,
         "Bag still full of protected or non-equipment items; paused")
+    return true
 end
 local function death(token)
     setAuto(false)
@@ -397,7 +434,7 @@ local function run(token)
         local maximum = tonumber(player:GetAttribute("BagSlotsMax")) or 120
         if state.ForceSell or used >= maximum-CONFIG.ReservedSlots or used/maximum*100 >= CONFIG.SellAtPercent then
             state.ForceSell = false
-            sellEquipment(token)
+            if not sellEquipment(token) then state.ForceSell=true; sleep(1,token); continue end
         end
         if state.ForceEquip then state.ForceEquip = false; equipBest(token) end
         if state.ForceCollect and state.CollectBossLoot then
@@ -595,6 +632,7 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
                 s.DodgeFailure=nil
                 ctx.SetAuto(false)
                 h:Move(Vector3.zero,false)
+                s.LastDodgeAt=os.clock()
                 c:PivotTo(CFrame.new(safe))
                 root.AssemblyLinearVelocity=Vector3.zero
                 s.Dodges=s.Dodges+1
@@ -723,42 +761,19 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
             if bossAvailable(boss) then fight(boss,token); return end
         end
     end
-    local pendingStatAt=0
-    local pendingStatValue=nil
-    local pendingStatName=nil
-    local requestedManualAt=nil
+    local statController=assert(loadstring(readfile("hunting-stats.lua")))()({
+        State=s,Player=p,MaxStat=config.MaxStat or 99,
+        StatUpgradeCost=require(RS.Shared:WaitForChild("StatFormulas")).StatUpgradeCost,
+        SetManual=function() r.SetAutoBuild:FireServer("manual") end,
+        Allocate=function(name) r.AllocateStat:FireServer(name) end,
+    },options)
     local attemptedBoost={}
     task.spawn(function()
         local refreshAt=0
         while not s.Destroyed do
             if os.clock()>refreshAt then readOptions(); refreshAt=os.clock()+2 end
+            statController.Step(s.Active and ctx.Character()~=nil)
             if s.Active and ctx.Character() then
-                if options.AutoStats then
-                    if (p:GetAttribute("AutoBuild") or "manual")~="manual" then
-                        if not requestedManualAt then
-                            requestedManualAt=os.clock()
-                            r.SetAutoBuild:FireServer("manual")
-                        elseif os.clock()-requestedManualAt>5 then
-                            options.AutoStats=false; persist()
-                            ctx.Status("Custom stats paused: Manual build was not confirmed")
-                        end
-                    elseif pendingStatValue then
-                        requestedManualAt=nil
-                        local current=tonumber(p:GetAttribute(pendingStatName)) or 0
-                        if current>pendingStatValue then pendingStatValue=nil
-                        elseif os.clock()-pendingStatAt>4 then
-                            pendingStatValue=nil; options.AutoStats=false; persist()
-                            ctx.Status("Stat allocation not confirmed; auto stats paused")
-                        end
-                    elseif (tonumber(p:GetAttribute("StatPoints")) or 0)>0 then
-                        requestedManualAt=nil
-                        local current=tonumber(p:GetAttribute(options.Primary)) or 0
-                        if current<(config.MaxStat or 99) then
-                            pendingStatName,pendingStatValue,pendingStatAt=options.Primary,current,os.clock()
-                            r.AllocateStat:FireServer(options.Primary)
-                        end
-                    end
-                else pendingStatValue=nil end
                 if options.AutoBoost then
                     for _,boost in ipairs({{Id="drop_potion",Key="Drop"},{Id="exp_potion",Key="Exp"}}) do
                         local untilTime=tonumber(p:GetAttribute("Boost"..boost.Key.."Until"))
@@ -785,13 +800,9 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
         local normalized=Settings.Normalize(input)
         options[key]=normalized[key]
         if key=="FarmRadius" then s.Zone=nil end
-        if key=="AutoStats" then
-            requestedManualAt=nil
-            if options.AutoStats and (p:GetAttribute("AutoBuild") or "manual")~="manual" then
-                requestedManualAt=os.clock(); r.SetAutoBuild:FireServer("manual")
-            end
-        end
+        if key=="AutoStats" or key=="Primary" then statController.Reset() end
         if key=="AutoBoost" then attemptedBoost={} end
+        if (key=="KeepTier5" or key=="KeepRollPercent") and s.QueueGearScan then s.QueueGearScan() end
         persist()
     end
     s.SaveSettings=persist
@@ -831,6 +842,7 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
         end
     end)
     assert(loadstring(readfile("hunting-team-box.lua")))()(ctx,options,persist)
+    assert(loadstring(readfile("hunting-gear-keep.lua")))()(ctx,options)
 end
 ]====],
     ["hunting-geometry.lua"] = [====[-- Geometry from the BossFx warning payload, in the horizontal plane.
@@ -1222,8 +1234,13 @@ return P
         if os.clock()<(s.DodgeUntil or 0) then ctx.SetAuto(false); return true end
         if (ownRoot.Position-leaderRoot.Position).Magnitude>28 then
             ctx.Status("Following "..plan.Leader.Name)
-            local offset=leaderRoot.CFrame.LookVector*-9+leaderRoot.CFrame.RightVector*5
-            if not ctx.MoveTo(leaderRoot.Position+offset,token) then return true end
+            if not ctx.MoveTo(function()
+                local currentPlan=team()
+                if currentPlan.IsLeader or currentPlan.LeaderId~=plan.LeaderId then return nil end
+                local currentLeader=rootOf(currentPlan.Leader)
+                if not currentLeader then return nil end
+                return currentLeader.Position+currentLeader.CFrame.LookVector*-9+currentLeader.CFrame.RightVector*5
+            end,token) then return true end
         end
         local signature=tostring(plan.LeaderId).."|"..tostring(plan.Healer).."|"..tostring(s.Zone)
         if cacheSignature~=signature then tuneSupport(plan.Healer); cacheSignature=signature end
@@ -1438,7 +1455,8 @@ return B
 S.Defaults={Bosses=false,Gorilla=true,Tiger=true,Pharaoh=true,Dragon=true,Turtle=true,
     AutoStats=false,Primary="DEX",AutoBoost=false,Dodge=true,SmartBoxes=true,
     ResumeOnLoad=true,LastRunning=true,Collapsed=false,Tab="Farm",UIX=0.025,UIY=0.08,
-    FarmRadius=40,FarmLayoutVersion=1,SellAtPercent=95,RestoreGameSkill=false,GameAutoSkill=false}
+    FarmRadius=40,FarmLayoutVersion=1,SellAtPercent=95,RestoreGameSkill=false,GameAutoSkill=false,
+    KeepTier5=true,KeepRollPercent=80}
 function S.Normalize(data)
     local result=table.clone(S.Defaults)
     if type(data)~="table" then return result end
@@ -1446,8 +1464,8 @@ function S.Normalize(data)
         if type(value)=="boolean" and type(data[key])=="boolean" then result[key]=data[key] end
     end
     if table.find({"STR","AGI","VIT","INT","DEX","LUK"},data.Primary) then result.Primary=data.Primary end
-    if table.find({"Farm","Boss","Character","Team"},data.Tab) then result.Tab=data.Tab end
-    for key,limits in pairs({UIX={0,0.95},UIY={0,0.95},FarmRadius={20,150},SellAtPercent={50,100}}) do
+    if table.find({"Farm","Boss","Character","Team","Gear"},data.Tab) then result.Tab=data.Tab end
+    for key,limits in pairs({UIX={0,0.95},UIY={0,0.95},FarmRadius={20,150},SellAtPercent={50,100},KeepRollPercent={50,100}}) do
         local value=data[key]
         if type(value)=="number" and value==value and math.abs(value)<math.huge then result[key]=math.clamp(value,limits[1],limits[2]) end
     end
@@ -1532,9 +1550,9 @@ return S
     local close=button(header,"×",462,10,26,28,function() s:Stop(); s:Destroy() end)
     local content=make("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(0,48),Size=UDim2.fromOffset(500,402)},panel)
     local tabBar=make("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(12,6),Size=UDim2.fromOffset(476,34)},content)
-    for i,entry in ipairs({{"Farm","ฟาร์ม"},{"Boss","บอส"},{"Character","ตัวละคร"},{"Team","ปาร์ตี้"}}) do
+    for i,entry in ipairs({{"Farm","ฟาร์ม"},{"Boss","บอส"},{"Character","ตัวละคร"},{"Team","ปาร์ตี้"},{"Gear","อุปกรณ์"}}) do
         local key=entry[1]
-        ui.Tabs[key]=button(tabBar,entry[2],(i-1)*120,0,116,32,function() s:SetOption("Tab",key); ui:Refresh() end)
+        ui.Tabs[key]=button(tabBar,entry[2],(i-1)*96,0,92,32,function() s:SetOption("Tab",key); ui:Refresh() end)
     end
     local summary=text(content,"",16,46,468,22,13,C.Accent)
     local status=text(content,"",16,69,468,30,12,C.Muted)
@@ -1600,10 +1618,12 @@ return S
     local character=page("Character")
     optionCheck(character,"AutoStats","อัปสเตตัสอัตโนมัติ","เพิ่มค่าที่เลือกเอง แยกจาก Build ของเกม")
     selectRow(character,"Primary","สเตตัสหลัก",{"STR","AGI","VIT","INT","DEX","LUK"})
-    local statCard=card(character,40)
+    local statCard=card(character,64)
     local statValues=text(statCard,"",12,8,440,26,13,C.Muted)
+    local statStatus=text(statCard,"",12,35,440,22,12,C.Muted)
     ui.Dynamic[#ui.Dynamic+1]=function()
         statValues.Text=s.Options.Primary.." "..tostring(p:GetAttribute(s.Options.Primary) or 0).." / 99   •   แต้มเหลือ "..tostring(p:GetAttribute("StatPoints") or 0)
+        statStatus.Text=s.StatStatus or "รอข้อมูลสเตตัส"
     end
     s.GameAutoSkillButton=checkbox(character,"อัปสกิลอัตโนมัติของเกม","ใช้ระบบ Auto Skill เดิมของเกม",
         function() return p:GetAttribute("AutoSkill")~=false end,function(on) s:SetGameAutoSkill(on) end)
@@ -1628,6 +1648,20 @@ return S
         local remaining=s.LuckyUntil and math.max(0,math.ceil(s.LuckyUntil()-workspace:GetServerTimeNow())) or 0
         boxLabel.Text="กล่อง: "..tostring(s.BoxStatus or "พร้อม").."\nLucky Drop: "..remaining.." วินาที"
     end
+    local gear=page("Gear")
+    optionCheck(gear,"KeepTier5","คัดและล็อกอุปกรณ์คลาส V","เก็บดาวขาว แดง ม่วง เหลือง • ขายน้ำเงิน/เขียว")
+    selectRow(gear,"KeepRollPercent","เกณฑ์ออปชัน • มีอย่างน้อยหนึ่งค่าถึงเกณฑ์",{70,80,90,100},function(v) return v.."%" end)
+    local limitsCard=card(gear,96)
+    local limitsLabel=text(limitsCard,"",12,8,440,80,13,C.Muted)
+    ui.Dynamic[#ui.Dynamic+1]=function()
+        local limits=s.GearLimits()
+        local function minimum(key) return limits[key] and tostring(limits[key].Min) or "?" end
+        limitsLabel.Text="CRIT ≥ "..minimum("CRIT").."   ASPD ≥ "..minimum("ASPD").."   AGI ≥ "..minimum("AGI")
+            .."\nMATK ≥ "..minimum("MatkPercent").."%   ร่าย ≥ "..minimum("CastSpeed").."%   ลด CD ≥ "..minimum("Cooldown").."%"
+            .."\n"..tostring(s.GearKeepStatus or "รอตรวจอุปกรณ์")
+    end
+    local rulesCard=card(gear,126)
+    text(rulesCard,"ดาบ / มีด: CRIT    ธนู: CRIT หรือ ASPD\nคทา: CRIT หรือ %MATK    สมุด: ลดคูลดาวน์\nขวาน: CRIT หรือ AGI\nแหวน: CRIT / ASPD / ความเร็วร่าย\nของที่ใส่อยู่หรือล็อกไว้จะไม่ถูกขาย",12,8,440,110,12,C.Muted)
     make("Frame",{BackgroundColor3=C.Border,BorderSizePixel=0,Position=UDim2.fromOffset(12,344),Size=UDim2.fromOffset(476,1)},content)
     local runButton=button(content,"เริ่มฟาร์ม",12,353,132,34,function() if s.Active then s:Stop() else s:Start() end; ui:Refresh() end,true)
     button(content,"ขายอุปกรณ์",152,353,142,34,function() s:RequestSell() end)
@@ -1957,6 +1991,179 @@ return P
             Clearance=P.Clearance,Choices=P.Choices(start,position(destination),others,boundsFor(root))}
     end
     return beforeWarp
+end
+]====],
+    ["hunting-stats.lua"] = [====[return function(ctx,options)
+    local s,p=ctx.State,ctx.Player
+    local pending,blocked=nil,nil
+    local function reset()
+        pending,blocked=nil,nil
+    end
+    local function step(active,now)
+        now=now or os.clock()
+        local name=options.Primary
+        local value=tonumber(p:GetAttribute(name)) or 1
+        local points=tonumber(p:GetAttribute("StatPoints")) or 0
+        local build=p:GetAttribute("AutoBuild") or "manual"
+        local costOK,cost=pcall(ctx.StatUpgradeCost,value)
+        s.StatCost=costOK and tonumber(cost) or nil
+        if not options.AutoStats then reset(); s.StatStatus="ปิดอยู่"; return end
+        if not active then s.StatStatus="รอเริ่มฟาร์ม"; return end
+        local signature=name.."|"..value.."|"..points.."|"..tostring(build)
+        if pending then
+            local confirmed=(pending.Kind=="build" and build=="manual")
+                or (pending.Kind=="stat" and (tonumber(p:GetAttribute(pending.Stat)) or 1)>pending.Before)
+            if confirmed then pending=nil; blocked=nil
+            elseif now-pending.At<5 then s.StatStatus="กำลังรอเกมยืนยัน"; return
+            else pending=nil; blocked=signature end
+        end
+        if value>=(ctx.MaxStat or 99) then s.StatStatus="ค่านี้เต็มแล้ว • รอเลือกค่าอื่น"; return end
+        if not s.StatCost or s.StatCost<1 then s.StatStatus="รอข้อมูลค่าใช้แต้ม"; return end
+        if points<s.StatCost then
+            s.StatStatus="รอแต้ม "..points.." / "..s.StatCost
+            return
+        end
+        if blocked==signature then s.StatStatus="รอข้อมูลเกมเปลี่ยน • ยังเปิดอัตโนมัติอยู่"; return end
+        if build~="manual" then
+            pending={Kind="build",At=now}
+            s.StatStatus="กำลังเปลี่ยน Build เป็น Manual"
+            local ok=pcall(ctx.SetManual)
+            if not ok then pending=nil; blocked=signature; s.StatStatus="รอเกมพร้อม • ยังเปิดอัตโนมัติอยู่" end
+            return
+        end
+        pending={Kind="stat",Stat=name,Before=value,At=now}
+        s.StatStatus="กำลังอัป "..name
+        local ok=pcall(ctx.Allocate,name)
+        if not ok then pending=nil; blocked=signature; s.StatStatus="รอเกมพร้อม • ยังเปิดอัตโนมัติอยู่" end
+    end
+    return {Step=step,Reset=reset}
+end
+]====],
+    ["hunting-gear-policy.lua"] = [====[local P={}
+P.WeaponStats={sword={"CRIT"},knife={"CRIT"},bow={"CRIT","ASPD"},rod={"CRIT","MatkPercent"},book={"Cooldown"},axe={"CRIT","AGI"}}
+P.RingStats={"CRIT","ASPD","CastSpeed"}
+P.KeepColors={White=true,Red=true,Purple=true,Yellow=true}
+P.SellColors={Blue=true,Green=true}
+function P.Limits(data,percent)
+    local result={}
+    local options=data.Options or {}
+    for _,key in ipairs({"CRIT","ASPD","MatkPercent","Cooldown","AGI","CastSpeed"}) do
+        local ranges=(options.SpecialRange or {})[key] or (options.LineRange or {})[key] or options.Stat
+        local range=type(ranges)=="table" and ranges[5]
+        if type(range)=="table" and tonumber(range[1]) and tonumber(range[2]) then
+            result[key]={Min=math.max(range[1],math.ceil(range[2]*percent/100)),Max=range[2]}
+        end
+    end
+    return result
+end
+function P.Decide(item,data,styles,percent)
+    if type(item)~="table" then return "hold","อ่านข้อมูลอุปกรณ์ไม่ได้" end
+    if item.Kind~="armor" and item.Kind~="weapon" then return "ignore","ไม่ใช่อุปกรณ์" end
+    if tonumber(item.Tier)~=5 then return "sell","ใช้กฎเดิมสำหรับคลาสอื่น" end
+    local wanted
+    if item.Kind=="weapon" then
+        wanted=P.WeaponStats[item.WeaponType]
+        if not wanted then return "hold","ยังไม่มีกฎสำหรับอาวุธชนิดนี้" end
+    elseif item.Slot=="Acc" or item.Slot=="Acc1" or item.Slot=="Acc2" then
+        wanted=P.RingStats
+    else
+        local style=item.SetId and styles[item.SetId]
+        local color=style and style.Name
+        if P.KeepColors[color] then return "lock","ดาวเซต "..color end
+        if P.SellColors[color] then return "sell","ดาวเซต "..color end
+        return "hold","รอข้อมูลสีดาวเซต" end
+    if type(item.Options)~="table" then return "hold","รอข้อมูลออปชัน" end
+    local limits=P.Limits(data,percent)
+    for _,key in ipairs(wanted) do
+        local limit=limits[key]
+        if not limit then return "hold","รอช่วงค่าสุ่ม "..key end
+        local value=tonumber(item.Options[key]) or 0
+        if value>=limit.Min then
+            return "lock",key.." "..value.." / "..limit.Max,{Key=key,Value=value,Min=limit.Min,Max=limit.Max}
+        end
+    end
+    return "sell","ไม่มีออปชันที่ต้องการถึงเกณฑ์"
+end
+return P
+]====],
+    ["hunting-gear-keep.lua"] = [====[return function(ctx,options)
+    local s,p=ctx.State,ctx.Player
+    local policy=assert(loadstring(readfile("hunting-gear-policy.lua")))()
+    local data=require(game.ReplicatedStorage.Shared:WaitForChild("GearData"))
+    local util=require(game.ReplicatedStorage.Shared:WaitForChild("GearUtil"))
+    local dirty,syncing,retryAfter=true,false,0
+    s.GearDecision=function(item)
+        if not options.KeepTier5 then return "sell","ปิดการคัดคลาส V" end
+        return policy.Decide(item,data,util.SetStyle,options.KeepRollPercent)
+    end
+    s.GearLimits=function() return policy.Limits(data,options.KeepRollPercent) end
+    s.QueueGearScan=function() dirty=true; retryAfter=0 end
+    local function preview()
+        local result={}
+        local gears=ctx.Json("GearJson")
+        for id in pairs(gears) do
+            local ok,item=pcall(util.Resolve,id,gears)
+            if ok and item then
+                local action,reason,detail=s.GearDecision(item)
+                if item.Tier==5 then
+                    result[#result+1]={Id=id,Name=item.Name,Action=action,Reason=reason,Detail=detail,
+                        Locked=ctx.Json("LocksJson")[id]==true}
+                end
+            end
+        end
+        table.sort(result,function(a,b) return a.Id<b.Id end)
+        return result
+    end
+    s.PreviewGearKeep=preview
+    local function synchronize(token)
+        if not options.KeepTier5 then s.GearKeepStatus="ปิดการคัดคลาส V"; dirty=false; return true end
+        if os.clock()<retryAfter then return false end
+        local count=0
+        for _,entry in ipairs(preview()) do
+            ctx.Check(token)
+            if not options.KeepTier5 then return true end
+            if entry.Action=="hold" then count+=1 end
+            if entry.Action=="lock" then
+                count+=1
+                if not ctx.Json("LocksJson")[entry.Id] then
+                    ctx.Remotes.LockItem:FireServer(entry.Id,true)
+                    local untilTime=os.clock()+3
+                    repeat
+                        ctx.Sleep(0.15,token)
+                        if ctx.Json("LocksJson")[entry.Id] or not ctx.Json("GearJson")[entry.Id] then break end
+                    until os.clock()>=untilTime
+                    if ctx.Json("GearJson")[entry.Id] and not ctx.Json("LocksJson")[entry.Id] then
+                        s.GearKeepStatus="รอยืนยันล็อก "..entry.Name
+                        retryAfter=os.clock()+5
+                        return false
+                    end
+                end
+            end
+        end
+        s.GearProtectedCount=count
+        s.GearKeepStatus="ตรวจคัดคลาส V แล้ว • เก็บ "..count.." ชิ้น"
+        return true
+    end
+    s.EnsureGearLocks=function(token)
+        while syncing do ctx.Sleep(0.1,token) end
+        syncing=true
+        dirty=false -- Changes replicated during this pass queue another pass.
+        local ok,result=pcall(synchronize,token)
+        syncing=false
+        if not ok then dirty=true; error(result,0) end
+        if not result then dirty=true end
+        return result
+    end
+    table.insert(s.Connections,p:GetAttributeChangedSignal("GearJson"):Connect(function() dirty=true end))
+    task.spawn(function()
+        while not s.Destroyed do
+            if s.Active and dirty and os.clock()>=retryAfter then
+                local ok=pcall(s.EnsureGearLocks,s.Generation)
+                if not ok then retryAfter=os.clock()+2 end
+            end
+            task.wait(0.5)
+        end
+    end)
 end
 ]====]
 }
