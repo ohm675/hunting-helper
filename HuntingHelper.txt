@@ -94,6 +94,8 @@ local function saveStatus()
             StatStatus = state.StatStatus, StatCost = state.StatCost,
             LastTravel = state.LastTravel,
             GearKeepStatus=state.GearKeepStatus,GearProtectedCount=state.GearProtectedCount,
+            ProgressionBlock=state.ProgressionBlock,
+            SkillPlanStatus=state.SkillPlanStatus,Job=player:GetAttribute("Job"),SkillPoints=player:GetAttribute("SkillPoints"),
         }))
     end)
 end
@@ -121,7 +123,8 @@ local function pickZone(level)
     for id, data in pairs(MapData) do
         if type(data) == "table" and id:match("^Field%d+$") and not data.BossRoom and zones[id] then
             local minimum = tonumber((data.LevelText or ""):match("%d+"))
-            if minimum and minimum <= level and (data.Order or 999) <= CONFIG.MaxZoneOrder then
+            if minimum and minimum <= level and (data.Order or 999) <= CONFIG.MaxZoneOrder
+                and (not state.CanEnterZone or state.CanEnterZone(id)) then
                 table.insert(options, {Id=id, Data=data, Minimum=minimum})
             end
         end
@@ -430,6 +433,8 @@ local function run(token)
             sleep(1,token)
             continue
         end
+        local farmLevel=state.GetFarmLevel and state.GetFarmLevel() or tonumber(player:GetAttribute("Level")) or 1
+        if state.UpdateProgression then state.UpdateProgression(farmLevel) end
         local used = tonumber(player:GetAttribute("BagSlotsUsed")) or 0
         local maximum = tonumber(player:GetAttribute("BagSlotsMax")) or 120
         if state.ForceSell or used >= maximum-CONFIG.ReservedSlots or used/maximum*100 >= CONFIG.SellAtPercent then
@@ -445,7 +450,6 @@ local function run(token)
         end
         if state.PartyFollow and state.PartyFollow(token) then saveStatus(); sleep(0.5,token); continue end
         if state.BossController then state.BossController(token) end
-        local farmLevel=state.GetFarmLevel and state.GetFarmLevel() or tonumber(player:GetAttribute("Level")) or 1
         local zone = assert(pickZone(farmLevel), "No suitable zone found")
         local _, _, root = character()
         if root and (state.Zone ~= zone.Id or not inZone(root, zone)) then
@@ -458,7 +462,8 @@ local function run(token)
                 end
                 prepareFarm(zone, token)
                 state.Zone = zone.Id
-                status("Farming: " .. zone.Data.DisplayName .. " | " .. zone.Data.LevelText)
+                status("Farming: " .. zone.Data.DisplayName .. " | " .. zone.Data.LevelText
+                    ..(state.ProgressionBlock and " | Waiting for "..state.ProgressionBlock.Label or ""))
             end
         elseif root and player:GetAttribute("AutoOn") ~= true then
             setAuto(true)
@@ -579,15 +584,24 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
         local definition=monsters[boss.Id]
         local level=s.GetFarmLevel and s.GetFarmLevel() or tonumber(p:GetAttribute("Level")) or 1
         local healer=false
+        local strongest=level
+        local partyCount=1
         if s.GetTeamPlan then
-            for _,member in ipairs(s.GetTeamPlan().Members) do if member.Job=="Cleric" then healer=true end end
+            local plan=s.GetTeamPlan()
+            partyCount=#plan.Members
+            for _,member in ipairs(plan.Members) do
+                if member.Job=="Cleric" then healer=true else strongest=math.max(strongest,member.Level or 1) end
+            end
         end
+        local carry=partyCount>1 and s.ProgressionBlock and s.ProgressionBlock.Room==boss.Room
+            and strongest>=BossPlan.RequiredLevel(definition,config.MaxBaseLevel or 99)
         return BossPlan.Readiness(boss,definition,{Level=level,MaxHP=tonumber(p:GetAttribute("MaxHP")) or 0,
             DEF=tonumber(p:GetAttribute("DEF")) or 0,MDEF=tonumber(p:GetAttribute("MDEF")) or 0,
-            HasHealer=healer},config.MaxBaseLevel or 99)
+            HasHealer=healer,RequiredLevel=carry and tonumber(definition.Level) or nil},config.MaxBaseLevel or 99)
     end
     local function bossAvailable(boss)
         if not options[boss.Option] or not readiness(boss) then return false end
+        if s.CanEnterZone and not s.CanEnterZone(boss.Room) then return false end
         if (blocked[boss.Id] or 0)>workspace:GetServerTimeNow() then return false end
         return workspace:GetAttribute("BossAlive_"..boss.Id)==true or alive(boss.Id)~=nil
     end
@@ -654,6 +668,7 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
     end
     local function fight(boss,token)
         local definition=monsters[boss.Id]
+        local _,_,entryMinimum=readiness(boss)
         local zone=(ctx.Nav().Zones or {})[boss.Room]
         if not zone then return end
         ctx.Status("Boss: "..definition.Name)
@@ -670,6 +685,19 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
                 ctx.Sleep(0.25,token)
             end
             if not model then blocked[boss.Id]=workspace:GetServerTimeNow()+30; return end
+            if s.ProgressionBlock and s.ProgressionBlock.Room==boss.Room and s.PartyInBossRoom then
+                local waitUntil=os.clock()+20
+                while not s.PartyInBossRoom(boss.Room) and os.clock()<waitUntil do
+                    ctx.SetAuto(false)
+                    ctx.Status("Waiting for every party member in "..definition.Name.." room")
+                    ctx.Sleep(0.2,token)
+                end
+                if not s.PartyInBossRoom(boss.Room) then
+                    blocked[boss.Id]=workspace:GetServerTimeNow()+30
+                    ctx.Status("Party not ready in boss room; returning to shared farm")
+                    return
+                end
+            end
             local settings=ctx.Json("BotJson")
             settings.FixedArea=false
             settings.AttackLeader=true
@@ -690,7 +718,7 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
             local damageAt=started
             while options.Bosses and options[boss.Option] and os.clock()-started<(boss.Timeout or 240) do
                 ctx.Check(token)
-                if s.GetFarmLevel and s.GetFarmLevel()<BossPlan.RequiredLevel(definition,config.MaxBaseLevel or 99) then
+                if s.GetFarmLevel and s.GetFarmLevel()<entryMinimum then
                     ctx.Status("Party minimum level changed; leaving boss room")
                     return
                 end
@@ -803,6 +831,14 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
         if key=="AutoStats" or key=="Primary" then statController.Reset() end
         if key=="AutoBoost" then attemptedBoost={} end
         if (key=="KeepTier5" or key=="KeepRollPercent") and s.QueueGearScan then s.QueueGearScan() end
+        if key=="SkillOrders" and s.ResetSkillPlan then s.ResetSkillPlan() end
+        if key=="SkillPlanEnabled" then
+            if s.ResetSkillPlan then s.ResetSkillPlan() end
+            if options.SkillPlanEnabled then
+                options.RestoreGameSkill=true; options.GameAutoSkill=false
+                if s.SetGameAutoSkill then s:SetGameAutoSkill(false) end
+            end
+        end
         persist()
     end
     s.SaveSettings=persist
@@ -819,6 +855,7 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
     local skillPending=nil
     s.SetGameAutoSkill=function(_,on)
         if skillPending or type(on)~="boolean" then return end
+        if on then options.SkillPlanEnabled=false end
         options.RestoreGameSkill=true
         options.GameAutoSkill=on
         persist()
@@ -842,7 +879,9 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
         end
     end)
     assert(loadstring(readfile("hunting-team-box.lua")))()(ctx,options,persist)
+    assert(loadstring(readfile("hunting-progression.lua")))()(ctx)
     assert(loadstring(readfile("hunting-gear-keep.lua")))()(ctx,options)
+    assert(loadstring(readfile("hunting-skills.lua")))()(ctx,options)
 end
 ]====],
     ["hunting-geometry.lua"] = [====[-- Geometry from the BossFx warning payload, in the horizontal plane.
@@ -1164,6 +1203,18 @@ return P
         return result
     end
     s.GetTeamPlan=team
+    s.PartyInBossRoom=function(room)
+        local zone=(ctx.Nav().Zones or {})[room]
+        if not zone then return false end
+        local plan=team()
+        if not plan.Ready then return false end
+        for _,member in ipairs(plan.Members) do
+            local root=rootOf(member.Player)
+            if not root or math.abs(root.Position.X-zone.X)>zone.SX/2+8
+                or math.abs(root.Position.Z-zone.Z)>zone.SZ/2+8 or math.abs(root.Position.Y-zone.Y)>35 then return false end
+        end
+        return true
+    end
     s.GetFarmLevel=function() return team().Level end
     local function luckyUntil()
         local untilTime=inferredLuckyUntil
@@ -1224,11 +1275,26 @@ return P
         boxStatus("Follower: main character opens boxes")
         local ownRoot=rootOf(p)
         local leaderRoot=rootOf(plan.Leader)
-        if not ownRoot or not leaderRoot then ctx.SetAuto(false); ctx.Status("Waiting for party leader"); return true end
+        if not ownRoot then ctx.SetAuto(false); ctx.Status("Waiting for own character"); return true end
+        if not leaderRoot then
+            s.BossActive=nil
+            ctx.Status("Regrouping at the shared farm zone")
+            return false -- A distant character can be streamed out; meet in the shared unlocked field.
+        end
         local bossRoom
+        local leaderZone
         for id,z in pairs(ctx.Nav().Zones or {}) do
-            if id:match("^Boss") and math.abs(leaderRoot.Position.X-z.X)<z.SX/2+5
-                and math.abs(leaderRoot.Position.Z-z.Z)<z.SZ/2+5 then bossRoom=id; break end
+            if math.abs(leaderRoot.Position.X-z.X)<z.SX/2+5 and math.abs(leaderRoot.Position.Z-z.Z)<z.SZ/2+5
+                and math.abs(leaderRoot.Position.Y-z.Y)<45 then
+                leaderZone=id
+                bossRoom=id:match("^Boss") and id or nil
+                break
+            end
+        end
+        if leaderZone and s.CanEnterZone and not s.CanEnterZone(leaderZone) then
+            s.BossActive=nil
+            boxStatus("Waiting for the party's locked boss gate")
+            return false
         end
         s.BossActive=bossRoom and {Id="party_boss",Room=bossRoom} or nil
         if os.clock()<(s.DodgeUntil or 0) then ctx.SetAuto(false); return true end
@@ -1304,7 +1370,8 @@ return P
         s.Zone=nil
     end
     s.ShouldHuntBoss=function()
-        return not pending and not encounter and not boxError and luckyUntil()<=workspace:GetServerTimeNow() and team().GroupReady
+        local plan=team()
+        return plan.IsLeader and not pending and not encounter and not boxError and luckyUntil()<=workspace:GetServerTimeNow() and plan.GroupReady
     end
     s.BoxController=function(token)
         local plan=team()
@@ -1431,7 +1498,7 @@ function B.RequiredLevel(definition,cap)
     return math.min(cap or 99,(tonumber(definition.Level) or 99)+5)
 end
 function B.Readiness(entry,definition,stats,cap)
-    local minimum=B.RequiredLevel(definition,cap)
+    local minimum=stats.RequiredLevel or B.RequiredLevel(definition,cap)
     if (stats.Level or 1)<minimum then return false,"Lv."..minimum,minimum end
     local peak=0
     local function inspect(skill,depth)
@@ -1456,15 +1523,29 @@ S.Defaults={Bosses=false,Gorilla=true,Tiger=true,Pharaoh=true,Dragon=true,Turtle
     AutoStats=false,Primary="DEX",AutoBoost=false,Dodge=true,SmartBoxes=true,
     ResumeOnLoad=true,LastRunning=true,Collapsed=false,Tab="Farm",UIX=0.025,UIY=0.08,
     FarmRadius=40,FarmLayoutVersion=1,SellAtPercent=95,RestoreGameSkill=false,GameAutoSkill=false,
-    KeepTier5=true,KeepRollPercent=80}
+    KeepTier5=true,KeepRollPercent=80,SkillPlanEnabled=false,SkillOrders={}}
 function S.Normalize(data)
     local result=table.clone(S.Defaults)
+    result.SkillOrders={}
     if type(data)~="table" then return result end
     for key,value in pairs(result) do
         if type(value)=="boolean" and type(data[key])=="boolean" then result[key]=data[key] end
     end
     if table.find({"STR","AGI","VIT","INT","DEX","LUK"},data.Primary) then result.Primary=data.Primary end
-    if table.find({"Farm","Boss","Character","Team","Gear"},data.Tab) then result.Tab=data.Tab end
+    if table.find({"Farm","Boss","Character","Team","Gear","Skills"},data.Tab) then result.Tab=data.Tab end
+    if type(data.SkillOrders)=="table" then
+        for job,order in pairs(data.SkillOrders) do
+            if type(job)=="string" and #job<64 and type(order)=="table" then
+                local clean,seen={},{}
+                for _,id in ipairs(order) do
+                    if type(id)=="string" and #id<80 and id:match("^[%w_]+$") and not seen[id] and #clean<64 then
+                        clean[#clean+1]=id; seen[id]=true
+                    end
+                end
+                result.SkillOrders[job]=clean
+            end
+        end
+    end
     for key,limits in pairs({UIX={0,0.95},UIY={0,0.95},FarmRadius={20,150},SellAtPercent={50,100},KeepRollPercent={50,100}}) do
         local value=data[key]
         if type(value)=="number" and value==value and math.abs(value)<math.huge then result[key]=math.clamp(value,limits[1],limits[2]) end
@@ -1550,9 +1631,9 @@ return S
     local close=button(header,"×",462,10,26,28,function() s:Stop(); s:Destroy() end)
     local content=make("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(0,48),Size=UDim2.fromOffset(500,402)},panel)
     local tabBar=make("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(12,6),Size=UDim2.fromOffset(476,34)},content)
-    for i,entry in ipairs({{"Farm","ฟาร์ม"},{"Boss","บอส"},{"Character","ตัวละคร"},{"Team","ปาร์ตี้"},{"Gear","อุปกรณ์"}}) do
+    for i,entry in ipairs({{"Farm","ฟาร์ม"},{"Boss","บอส"},{"Character","สเตตัส"},{"Skills","สกิล"},{"Team","ปาร์ตี้"},{"Gear","อุปกรณ์"}}) do
         local key=entry[1]
-        ui.Tabs[key]=button(tabBar,entry[2],(i-1)*96,0,92,32,function() s:SetOption("Tab",key); ui:Refresh() end)
+        ui.Tabs[key]=button(tabBar,entry[2],(i-1)*80,0,76,32,function() s:SetOption("Tab",key); ui:Refresh() end)
     end
     local summary=text(content,"",16,46,468,22,13,C.Accent)
     local status=text(content,"",16,69,468,30,12,C.Muted)
@@ -1625,10 +1706,56 @@ return S
         statValues.Text=s.Options.Primary.." "..tostring(p:GetAttribute(s.Options.Primary) or 0).." / 99   •   แต้มเหลือ "..tostring(p:GetAttribute("StatPoints") or 0)
         statStatus.Text=s.StatStatus or "รอข้อมูลสเตตัส"
     end
-    s.GameAutoSkillButton=checkbox(character,"อัปสกิลอัตโนมัติของเกม","ใช้ระบบ Auto Skill เดิมของเกม",
+    local skills=page("Skills")
+    local jobCard=card(skills,44)
+    local jobLabel=text(jobCard,"",12,8,440,28,14,C.Accent)
+    optionCheck(skills,"SkillPlanEnabled","อัปสกิลตามลำดับที่เลือก","ทุกสกิลที่ปลดล็อกได้ Lv.1 ก่อน • ปิด Auto Skill เดิม")
+    local planCard=card(skills,44)
+    local planLabel=text(planCard,"",12,8,440,28,12,C.Muted)
+    local skillList=make("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y},skills)
+    make("UIListLayout",{Padding=UDim.new(0,7),SortOrder=Enum.SortOrder.LayoutOrder},skillList)
+    ui.SkillRows={}
+    local lastSkillJob=nil
+    ui.Dynamic[#ui.Dynamic+1]=function()
+        local currentJob=p:GetAttribute("Job") or "Swordsman"
+        local catalog=s.SkillCatalog()
+        jobLabel.Text=currentJob.."   •   แต้มสกิล "..tostring(p:GetAttribute("SkillPoints") or 0)
+        planLabel.Text=s.SkillPlanStatus or "ติ๊กเพื่อจัดคิวอัปเต็ม • ใช้ ↑ ↓ เปลี่ยนลำดับ"
+        if lastSkillJob~=currentJob then
+            lastSkillJob=currentJob
+            for _,row in pairs(ui.SkillRows) do row.Frame:Destroy() end
+            ui.SkillRows={}
+            for index,entry in ipairs(catalog) do
+                local id=entry.Id
+                local row=card(skillList,58)
+                row.LayoutOrder=index
+                local choose=button(row,"",12,17,22,22,function() s.ToggleSkillPriority(id); ui:Refresh() end)
+                local name=text(row,"",45,5,300,25,13)
+                local detail=text(row,"",45,31,300,19,11,C.Muted)
+                local up=button(row,"↑",365,14,34,30,function() s.MoveSkillPriority(id,-1); ui:Refresh() end)
+                local down=button(row,"↓",408,14,34,30,function() s.MoveSkillPriority(id,1); ui:Refresh() end)
+                ui.SkillRows[id]={Frame=row,Choose=choose,Name=name,Detail=detail,Up=up,Down=down}
+            end
+        end
+        local order=s.SkillPriority()
+        for _,entry in ipairs(catalog) do
+            local row=ui.SkillRows[entry.Id]
+            local rank=table.find(order,entry.Id)
+            row.Choose.Text=rank and "✓" or ""
+            row.Choose.BackgroundColor3=rank and C.Accent or C.Row
+            row.Choose.TextColor3=C.Dark
+            row.Choose.Active=not entry.Innate
+            row.Name.Text=(rank and rank..". " or "")..entry.Name.."  "..entry.Level.."/"..entry.Max
+            row.Detail.Text=entry.Innate and "สกิลติดตัว" or ((p:GetAttribute("Level") or 1)<entry.Unlock and "รอปลดล็อก Lv."..entry.Unlock
+                or (rank and "คิวอัปเต็มอันดับ "..rank or "อัปเต็มหลังคิวหลัก"))
+            row.Up.Visible=rank~=nil and rank>1
+            row.Down.Visible=rank~=nil and rank<#order
+        end
+    end
+    s.GameAutoSkillButton=checkbox(skills,"อัปสกิลอัตโนมัติของเกม","เปิดระบบเดิมจะปิดโหมดจัดลำดับเอง",
         function() return p:GetAttribute("AutoSkill")~=false end,function(on) s:SetGameAutoSkill(on) end)
     s.GameAutoSkillButton.Name="GameAutoSkill"
-    local skillInfo=card(character,38)
+    local skillInfo=card(skills,38)
     local skillLabel=text(skillInfo,"",12,7,440,24,12,C.Muted)
     ui.Dynamic[#ui.Dynamic+1]=function()
         skillLabel.Text=s.GameAutoSkillError or (s.GameAutoSkillPending and "กำลังรอเกมยืนยัน..." or "แต้มสกิลเหลือ "..tostring(p:GetAttribute("SkillPoints") or 0).." • จำตัวเลือกแยกตามไอดี")
@@ -1647,6 +1774,7 @@ return S
             .."\n"..(t.Ready==false and "กำลังรอข้อมูลสมาชิก" or "ยึดเลเวลต่ำสุด รวมสมาชิกที่ตาย")
         local remaining=s.LuckyUntil and math.max(0,math.ceil(s.LuckyUntil()-workspace:GetServerTimeNow())) or 0
         boxLabel.Text="กล่อง: "..tostring(s.BoxStatus or "พร้อม").."\nLucky Drop: "..remaining.." วินาที"
+            ..(s.ProgressionBlock and "\nรอผ่านบอส: "..s.ProgressionBlock.Label or "")
     end
     local gear=page("Gear")
     optionCheck(gear,"KeepTier5","คัดและล็อกอุปกรณ์คลาส V","เก็บดาวขาว แดง ม่วง เหลือง • ขายน้ำเงิน/เขียว")
@@ -2162,6 +2290,167 @@ return P
                 if not ok then retryAfter=os.clock()+2 end
             end
             task.wait(0.5)
+        end
+    end)
+end
+]====],
+    ["hunting-gates.lua"] = [====[local P={}
+function P.Blocked(map,destination,members)
+    local target=map[destination]
+    if not target then return nil end
+    local blocked
+    for room,boss in pairs(map) do
+        local unlock=type(boss)=="table" and boss.BossRoom and boss.Unlocks and map[boss.Unlocks]
+        if unlock and (target.Order or 0)>=(unlock.Order or math.huge) then
+            local missing={}
+            for _,member in ipairs(members) do
+                if type(member.Gates)~="table" or member.Gates[room]~=true then missing[#missing+1]=member.Id end
+            end
+            if #missing>0 and (not blocked or (boss.Order or 0)<blocked.Order) then
+                blocked={Room=room,Order=boss.Order or 0,Boss=boss.Boss,Unlocks=boss.Unlocks,Missing=missing}
+            end
+        end
+    end
+    return blocked
+end
+return P
+]====],
+    ["hunting-progression.lua"] = [====[return function(ctx)
+    local s=ctx.State
+    local map=require(game.ReplicatedStorage.Shared.MapData)
+    local policy=assert(loadstring(readfile("hunting-gates.lua")))()
+    local function members()
+        local result={}
+        for _,member in ipairs(s.GetTeamPlan().Members) do
+            result[#result+1]={Id=member.Id,Gates=member.Player and ctx.Decode(member.Player:GetAttribute("BossGatesJson")) or nil}
+        end
+        return result
+    end
+    s.CanEnterZone=function(id) return policy.Blocked(map,id,members())==nil end
+    s.UpdateProgression=function(level)
+        local bestId,bestOrder=nil,-math.huge
+        for id,zone in pairs(map) do
+            local minimum=type(zone)=="table" and tonumber(tostring(zone.LevelText or ""):match("%d+"))
+            if id:match("^Field%d+$") and minimum and minimum<=level and (zone.Order or 999)<=ctx.Config.MaxZoneOrder
+                and (zone.Order or 0)>bestOrder then bestId,bestOrder=id,zone.Order end
+        end
+        local blocked=bestId and policy.Blocked(map,bestId,members())
+        if blocked then blocked.Label=(ctx.Monsters[blocked.Boss] or {}).Name or blocked.Room end
+        s.ProgressionBlock=blocked
+        return blocked
+    end
+    s.UpdateProgression(s.GetFarmLevel())
+end
+]====],
+    ["hunting-skill-policy.lua"] = [====[local P={}
+function P.Order(data,job,priority)
+    local result,seen={},{}
+    local function add(id)
+        local skill=data.Skills[id]
+        if skill and skill.Job==job and not skill.Innate and not seen[id] then result[#result+1]=id; seen[id]=true end
+    end
+    for _,id in ipairs(priority or {}) do add(id) end
+    for _,id in ipairs(data.ByJob[job] or {}) do add(id) end
+    return result
+end
+function P.Next(data,job,level,known,priority,points)
+    -- Newly available skills always get their first point before ranks 2+.
+    for _,id in ipairs(P.Order(data,job,{})) do
+        local skill=data.Skills[id]
+        if (skill.Unlock or 1)<=level and (tonumber(known[id]) or 0)<1 then
+            return points>0 and id or nil,points>0 and "unlock" or "points",id
+        end
+    end
+    for _,id in ipairs(P.Order(data,job,priority)) do
+        local skill=data.Skills[id]
+        if (tonumber(known[id]) or 0)<(skill.MaxLevel or data.MaxLevel or 10) then
+            if level<(skill.Unlock or 1) then return nil,"level",id end
+            return points>0 and id or nil,points>0 and "upgrade" or "points",id
+        end
+    end
+    return nil,"complete"
+end
+return P
+]====],
+    ["hunting-skills.lua"] = [====[return function(ctx,options)
+    local s,p,r=ctx.State,ctx.Player,ctx.Remotes
+    local data=require(game.ReplicatedStorage.Shared:WaitForChild("SkillData"))
+    local policy=assert(loadstring(readfile("hunting-skill-policy.lua")))()
+    local pending,blocked=nil,nil
+    local function reset() pending,blocked=nil,nil end
+    local function job() return p:GetAttribute("Job") or "Swordsman" end
+    local function priority() return options.SkillOrders[job()] or {} end
+    s.SkillPriority=function() return table.clone(priority()) end
+    s.SkillCatalog=function()
+        local result={}
+        local known=ctx.Json("SkillsJson")
+        for _,id in ipairs(data.ByJob[job()] or {}) do
+            local skill=data.Skills[id]
+            result[#result+1]={Id=id,Name=skill.Name or id,Level=tonumber(known[id]) or 0,
+                Max=skill.Innate and 1 or (skill.MaxLevel or data.MaxLevel or 10),Unlock=skill.Unlock or 1,Innate=skill.Innate==true}
+        end
+        return result
+    end
+    local function saveOrder(order)
+        local all=table.clone(options.SkillOrders)
+        all[job()]=order
+        s:SetOption("SkillOrders",all)
+        reset()
+    end
+    s.ToggleSkillPriority=function(id)
+        local skill=data.Skills[id]
+        if not skill or skill.Job~=job() or skill.Innate then return end
+        local order=table.clone(priority())
+        local index=table.find(order,id)
+        if index then table.remove(order,index) else order[#order+1]=id end
+        saveOrder(order)
+    end
+    s.MoveSkillPriority=function(id,delta)
+        local order=table.clone(priority())
+        local index=table.find(order,id)
+        if index and order[index+delta] then order[index],order[index+delta]=order[index+delta],order[index]; saveOrder(order) end
+    end
+    s.ResetSkillPlan=reset
+    if options.SkillPlanEnabled then
+        options.RestoreGameSkill=true; options.GameAutoSkill=false; s.SaveSettings()
+    end
+    task.spawn(function()
+        local lastJob=nil
+        while not s.Destroyed do
+            local currentJob=job()
+            if currentJob~=lastJob then lastJob=currentJob; reset() end
+            if not options.SkillPlanEnabled then
+                reset(); s.SkillPlanStatus="ปิดการจัดลำดับสกิล"
+            elseif p:GetAttribute("AutoSkill")~=false then
+                s.SkillPlanStatus="รอปิด Auto Skill ของเกม"
+                if not s.GameAutoSkillPending and not s.GameAutoSkillError then s:SetGameAutoSkill(false) end
+            elseif not s.Active or not ctx.Character() then
+                s.SkillPlanStatus="รอเริ่มฟาร์ม / ตัวละครพร้อม"
+            else
+                local known=ctx.Json("SkillsJson")
+                local points=tonumber(p:GetAttribute("SkillPoints")) or 0
+                local level=tonumber(p:GetAttribute("Level")) or 1
+                local signature=currentJob.."|"..level.."|"..points.."|"..tostring(p:GetAttribute("SkillsJson"))
+                if pending then
+                    if (tonumber(known[pending.Id]) or 0)>pending.Before then pending=nil; blocked=nil
+                    elseif os.clock()-pending.At>5 then pending=nil; blocked=signature end
+                end
+                if pending then s.SkillPlanStatus="รอเกมยืนยัน "..(data.Skills[pending.Id].Name or pending.Id)
+                elseif blocked==signature then s.SkillPlanStatus="รอข้อมูลเกมเปลี่ยน • ยังเปิดอัตโนมัติอยู่"
+                else
+                    local id,phase,nextId=policy.Next(data,currentJob,level,known,priority(),points)
+                    local definition=nextId and data.Skills[nextId]
+                    if id then
+                        pending={Id=id,Before=tonumber(known[id]) or 0,At=os.clock()}
+                        s.SkillPlanStatus=(phase=="unlock" and "เปิดใช้ Lv.1: " or "อัปตามคิว: ")..(definition.Name or id)
+                        local ok=pcall(function() r.LearnSkill:FireServer(id) end)
+                        if not ok then pending=nil; blocked=signature end
+                    elseif phase=="level" then s.SkillPlanStatus="รอ Lv."..definition.Unlock..": "..definition.Name
+                    elseif phase=="points" then s.SkillPlanStatus="รอแต้มสกิล"
+                    else s.SkillPlanStatus="สกิลอาชีพนี้เต็มแล้ว" end
+                end
+            end
+            task.wait(0.6)
         end
     end)
 end
