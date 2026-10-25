@@ -90,6 +90,7 @@ local function saveStatus()
             BoxEnemyCount=state.BoxEnemyCount,BoxReserved=state.BoxReserved,BoxBusy=state.BoxBusy,
             RegistryStatus=state.RegistryStatus,RegistryCount=state.Registry and state.Registry.Count,
             PartyActions=state.PartyActions,PartyError=state.PartyError,LastPartyNotice=state.LastPartyNotice,
+            HopStatus=state.HopStatus,HopSearch=state.HopSearch,HopDeparting=state.HopDeparting,
             LastBoxTrigger = state.LastBoxTrigger, LastBoxNotice = state.LastBoxNotice,
             GameAutoSkill = player:GetAttribute("AutoSkill"), GameAutoSkillError = state.GameAutoSkillError,
             FarmSpot = state.FarmSpot,
@@ -449,6 +450,7 @@ local function run(token)
     while state.Active and state.Generation == token do
         check(token)
         if state.BoxBusy then saveStatus(); sleep(0.1,token); continue end
+        if state.HopDeparting then saveStatus(); sleep(0.2,token); continue end
         if not character() or player:GetAttribute("HuntRespawnWaiting") == true then death(token) end
         if state.GetTeamPlan and not state.GetTeamPlan().Ready then
             setAuto(false)
@@ -520,6 +522,7 @@ function state:Stop(internal)
     self.Looting = false
     if self.BoxCancel then self.BoxCancel() end
     if self.CancelTravelWalk then self.CancelTravelWalk() end
+    if not internal and self.CancelHop then self.CancelHop() end
     if not internal and self.SetOption then self:SetOption("LastRunning",false) end
     if self.UI then self.UI:Refresh() end
     status("Paused")
@@ -823,6 +826,7 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
         if not finished then error(err,0) end
     end
     s.BossController=function(token)
+        if s.HopHold then return end
         if not options.Bosses then return end
         if s.ShouldHuntBoss and not s.ShouldHuntBoss() then return end
         for _,boss in ipairs(bosses) do
@@ -926,6 +930,7 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
     assert(loadstring(readfile("hunting-room-travel.lua")))()(ctx)
     assert(loadstring(readfile("hunting-party-online.lua")))()(ctx,options)
     assert(loadstring(readfile("hunting-boxes.lua")))()(ctx,options)
+    assert(loadstring(readfile("hunting-hop.lua")))()(ctx,options)
 end
 ]====],
     ["hunting-geometry.lua"] = [====[-- Geometry from the BossFx warning payload, in the horizontal plane.
@@ -1380,7 +1385,8 @@ S.Defaults={Bosses=false,Gorilla=true,Tiger=true,Pharaoh=true,Dragon=true,Turtle
     AutoStats=false,Primary="DEX",AutoBoost=false,Dodge=true,SmartBoxes=true,AutoParty=true,
     ResumeOnLoad=true,LastRunning=true,Collapsed=false,Tab="Farm",UIX=0.025,UIY=0.08,
     FarmRadius=40,FarmLayoutVersion=1,SellAtPercent=95,RestoreGameSkill=false,GameAutoSkill=false,
-    KeepTier5=true,KeepRollPercent=80,SkillPlanEnabled=false,SkillOrders={}}
+    KeepTier5=true,KeepRollPercent=80,SkillPlanEnabled=false,SkillOrders={},
+    HopTogether=true,FollowGroupHop=true,HopMaxAttempts=5}
 function S.Normalize(data)
     local result=table.clone(S.Defaults)
     result.SkillOrders={}
@@ -1389,7 +1395,7 @@ function S.Normalize(data)
         if type(value)=="boolean" and type(data[key])=="boolean" then result[key]=data[key] end
     end
     if table.find({"STR","AGI","VIT","INT","DEX","LUK"},data.Primary) then result.Primary=data.Primary end
-    if table.find({"Farm","Boss","Character","Team","Gear","Skills"},data.Tab) then result.Tab=data.Tab end
+    if table.find({"Farm","Boss","Character","Team","Gear","Skills","Server"},data.Tab) then result.Tab=data.Tab end
     if type(data.SkillOrders)=="table" then
         for job,order in pairs(data.SkillOrders) do
             if type(job)=="string" and #job<64 and type(order)=="table" then
@@ -1403,10 +1409,11 @@ function S.Normalize(data)
             end
         end
     end
-    for key,limits in pairs({UIX={0,0.95},UIY={0,0.95},FarmRadius={20,150},SellAtPercent={50,100},KeepRollPercent={50,100}}) do
+    for key,limits in pairs({UIX={0,0.95},UIY={0,0.95},FarmRadius={20,150},SellAtPercent={50,100},KeepRollPercent={50,100},HopMaxAttempts={1,10}}) do
         local value=data[key]
         if type(value)=="number" and value==value and math.abs(value)<math.huge then result[key]=math.clamp(value,limits[1],limits[2]) end
     end
+    result.HopMaxAttempts=math.floor(result.HopMaxAttempts)
     return result
 end
 function S.Open(id,http)
@@ -1488,9 +1495,9 @@ return S
     local close=button(header,"×",462,10,26,28,function() s:Stop(); s:Destroy() end)
     local content=make("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(0,48),Size=UDim2.fromOffset(500,402)},panel)
     local tabBar=make("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(12,6),Size=UDim2.fromOffset(476,34)},content)
-    for i,entry in ipairs({{"Farm","ฟาร์ม"},{"Boss","บอส"},{"Character","สเตตัส"},{"Skills","สกิล"},{"Team","ปาร์ตี้"},{"Gear","อุปกรณ์"}}) do
+    for i,entry in ipairs({{"Farm","ฟาร์ม"},{"Boss","บอส"},{"Character","สเตตัส"},{"Skills","สกิล"},{"Team","ปาร์ตี้"},{"Gear","อุปกรณ์"},{"Server","เซิร์ฟ"}}) do
         local key=entry[1]
-        ui.Tabs[key]=button(tabBar,entry[2],(i-1)*80,0,76,32,function() s:SetOption("Tab",key); ui:Refresh() end)
+        ui.Tabs[key]=button(tabBar,entry[2],(i-1)*68,0,64,32,function() s:SetOption("Tab",key); ui:Refresh() end)
     end
     local summary=text(content,"",16,46,468,22,13,C.Accent)
     local status=text(content,"",16,69,468,30,12,C.Muted)
@@ -1663,6 +1670,39 @@ return S
     end
     local rulesCard=card(gear,126)
     text(rulesCard,"ดาบ / มีด: CRIT    ธนู: CRIT หรือ ASPD\nคทา: CRIT หรือ %MATK    สมุด: ลดคูลดาวน์\nขวาน: CRIT หรือ AGI\nแหวน: CRIT / ASPD / ความเร็วร่าย\nของที่ใส่อยู่หรือล็อกไว้จะไม่ถูกขาย",12,8,440,110,12,C.Muted)
+    local servers=page("Server")
+    local hopStatusCard=card(servers,76)
+    local hopStatus=text(hopStatusCard,"",12,8,440,60,13,C.Accent)
+    optionCheck(servers,"HopTogether","แบบปาร์ตี้ • จอนี้ออกสำรวจก่อน","สมาชิกอื่นฟาร์มรอเซิร์ฟเดิม • เจอเงื่อนไขจึงเรียกตาม")
+    optionCheck(servers,"FollowGroupHop","ตามเมื่อจอสำรวจเรียกทีม","เฉพาะรหัสกลุ่มตรงกันและรายชื่อทีมตอนเริ่มสำรวจ")
+    local hopActions=card(servers,146)
+    button(hopActions,"Hop • เซิร์ฟคนน้อย",12,10,440,34,function() s.RequestHop("Population") end,true)
+    button(hopActions,"หาเซิร์ฟที่คนส่วนใหญ่เลเวลต่ำกว่าทีม",12,54,440,34,function() s.RequestHop("LowerLevels") end)
+    button(hopActions,"หาเซิร์ฟที่บอสทั้ง 5 ยังมีชีวิต",12,98,440,34,function() s.RequestHop("Boss5") end)
+    selectRow(servers,"HopMaxAttempts","จำนวนเซิร์ฟที่ยอมลอง • เว้นอย่างน้อย 30 วินาที",{1,3,5,10})
+    local hopControls=card(servers,88)
+    button(hopControls,"ดูรายชื่อ • ยังไม่ย้าย",12,10,215,30,function() s.PreviewServers() end)
+    button(hopControls,"เรียกทีมมาที่เซิร์ฟนี้",237,10,215,30,function() s.CallTeamHere() end)
+    button(hopControls,"หยุดค้นหาจอนี้",12,49,440,28,function() s.CancelHop() end)
+    local hopInfo=card(servers,106)
+    local hopInfoText=text(hopInfo,"",12,8,440,90,12,C.Muted)
+    local hopHint=card(servers,106)
+    text(hopHint,"ปิดแบบปาร์ตี้ = ย้ายเฉพาะจอนี้\nเลเวล: คนนอกอย่างน้อย 60% ต้องเลเวลต่ำกว่าต่ำสุดของทีม\nเลเวล/บอสใช้รายงานสดจากจอในกลุ่ม หรือเข้าไปตรวจเอง\nยังไม่มีวิธีรู้การ์ดดรอปแน่นอนก่อนมอนตาย",12,8,440,90,12,C.Muted)
+    ui.Dynamic[#ui.Dynamic+1]=function()
+        if s.Options.Tab~="Server" then return end
+        local observation=s.ServerObservation(false)
+        local alive=0;local known=0
+        for _,v in ipairs(observation.Bosses) do if v>=0 then known+=1 end;if v==1 then alive+=1 end end
+        hopStatus.Text=s.HopStatus or "เลือกโหมดแล้วกดค้นหา • ยังไม่ย้ายอัตโนมัติจนกดปุ่ม"
+        local searching=s.HopSearch
+        local lines={"บอสเซิร์ฟนี้: "..alive.."/5 มีชีวิต • ทราบสถานะ "..known.."/5"}
+        if searching then lines[#lines+1]="ลองแล้ว "..searching.Attempts.." / "..searching.Limit.." เซิร์ฟ" end
+        for index=1,math.min(3,#(s.HopCandidates or {})) do
+            local candidate=s.HopCandidates[index]
+            lines[#lines+1]=index..". คน "..candidate.Playing.."/"..candidate.MaxPlayers..(candidate.Known and " • มีรายงานสด" or " • ยังไม่ทราบเลเวล/บอส")
+        end
+        hopInfoText.Text=table.concat(lines,"\n")
+    end
     make("Frame",{BackgroundColor3=C.Border,BorderSizePixel=0,Position=UDim2.fromOffset(12,344),Size=UDim2.fromOffset(476,1)},content)
     local runButton=button(content,"เริ่มฟาร์ม",12,353,132,34,function() if s.Active then s:Stop() else s:Start() end; ui:Refresh() end,true)
     button(content,"ขายอุปกรณ์",152,353,142,34,function() s:RequestSell() end)
@@ -2505,7 +2545,7 @@ return P
     s.SetGroupCode=function(value)
         local clean=code(value)
         if not valid(clean) then s.RegistryStatus="รหัสกลุ่มต้องเป็นรหัส 32 ตัวที่คัดลอกจากอีกจอ"; return false end
-        s.GroupCode=clean; s.Registry=nil; s.RegistryStatus="กำลังเชื่อมต่อกลุ่มใหม่"
+        s.GroupCode=clean; s.Registry=nil; s.GroupTrip=nil; s.ServerReports={}; s.RegistryStatus="กำลังเชื่อมต่อกลุ่มใหม่"
         return persist()
     end
     s.NewGroupCode=function() return s.SetGroupCode(http:GenerateGUID(false):gsub("%-","")) end
@@ -2517,6 +2557,45 @@ return P
         if type(request)=="function" then return request end
         if type(http_request)=="function" then return http_request end
         if type(syn)=="table" and type(syn.request)=="function" then return syn.request end
+    end
+    local serverCache,serverCacheAt,serverRetryAt=nil,0,0
+    s.ReadServerPage=function(cursor)
+        if not cursor and serverCache and os.clock()-serverCacheAt<30 then return serverCache end
+        if os.clock()<serverRetryAt then
+            if not cursor and serverCache and os.clock()-serverCacheAt<120 then return serverCache end
+            return nil,"Roblox จำกัดความถี่ • รออีก "..math.ceil(serverRetryAt-os.clock()).." วินาที"
+        end
+        local send=requestFn()
+        if not send then return nil,"Executor ไม่มี HTTP request" end
+        local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true"
+        if cursor then url=url.."&cursor="..http:UrlEncode(cursor) end
+        local ok,response=pcall(send,{Url=url,Method="GET"})
+        if not ok or type(response)~="table" then return nil,"โหลดรายชื่อเซิร์ฟเวอร์ไม่สำเร็จ" end
+        if tonumber(response.StatusCode)==429 then
+            serverRetryAt=os.clock()+60
+            if not cursor and serverCache and os.clock()-serverCacheAt<120 then return serverCache end
+        end
+        if tonumber(response.StatusCode)~=200 then return nil,"รายชื่อเซิร์ฟเวอร์ HTTP "..tostring(response.StatusCode) end
+        local decoded,data=pcall(function() return http:JSONDecode(response.Body) end)
+        if not decoded or type(data)~="table" or type(data.data)~="table" then return nil,"รายชื่อเซิร์ฟเวอร์ไม่สมบูรณ์" end
+        if not cursor then serverCache=data; serverCacheAt=os.clock() end
+        return data
+    end
+    s.PostGroupTrip=function(action,fields)
+        local send=requestFn()
+        if not send or not options.AutoParty then return nil,"เปิดปาร์ตี้อัตโนมัติและเชื่อมกลุ่มก่อน" end
+        local body=table.clone(fields or {})
+        body.action=action; body.userId=p.UserId; body.gameId=game.GameId; body.jobId=game.JobId; body.sessionId=session
+        local group=s.GroupCode
+        local ok,response=pcall(send,{Url=endpoint:gsub("heartbeat$","trip"),Method="POST",Headers={
+            ["Content-Type"]="application/json",Authorization="Bearer "..group},Body=http:JSONEncode(body)})
+        if not ok or type(response)~="table" then return nil,"ติดต่อระบบสำรวจทีมไม่ได้" end
+        if group~=s.GroupCode or s.Destroyed then return nil,"กลุ่มเปลี่ยนแล้ว" end
+        local decoded,data=pcall(function() return http:JSONDecode(response.Body) end)
+        if not decoded or type(data)~="table" then return nil,"ข้อมูลสำรวจทีมไม่สมบูรณ์" end
+        if tonumber(response.StatusCode)~=200 or not data.trip then return nil,tostring(data.error or response.StatusCode) end
+        s.GroupTrip=data.trip
+        return data.trip
     end
     local function refresh()
         if not options.AutoParty then s.Registry=nil; s.RegistryStatus="ปาร์ตี้อัตโนมัติปิดอยู่"; return end
@@ -2530,7 +2609,9 @@ return P
             ["Content-Type"]="application/json",Authorization="Bearer "..group},Body=http:JSONEncode({
                 userId=p.UserId,gameId=game.GameId,jobId=game.JobId,sessionId=session,
                 level=tonumber(p:GetAttribute("Level")) or 1,job=p:GetAttribute("Job") or "Unknown",
-                party=ids,partyLeader=tonumber(party.Leader) or 0})})
+                party=ids,partyLeader=tonumber(party.Leader) or 0,
+                hopReady=s.HopReady==true,hopFollow=options.FollowGroupHop~=false,
+                report=s.ServerObservation and s.ServerObservation(true) or nil})})
         if s.Destroyed or group~=s.GroupCode or not options.AutoParty then return end
         if not ok or type(response)~="table" or tonumber(response.StatusCode)~=200 then
             s.Registry=nil; s.RegistryStatus="เชื่อมต่อกลุ่มไม่ได้ • พักการเชิญและรับปาร์ตี้"; return
@@ -2544,6 +2625,8 @@ return P
             if type(m.userId)=="number" and players:GetPlayerByUserId(m.userId) then members[m.userId]=m; count+=1 end
         end
         s.Registry={Members=members,Captain=data.captain,At=os.clock(),Count=count}
+        s.ServerReports=type(data.reports)=="table" and data.reports or {}
+        s.GroupTrip=type(data.trip)=="table" and data.trip or nil
         s.RegistryStatus="ออนไลน์กลุ่มเดียวกัน "..count.." คน • เชิญ/รับเฉพาะคนในกลุ่ม"
     end
     local function trusted(id)
@@ -2718,7 +2801,7 @@ end
         local decision=ready(plan,#live)
         if decision~="ready" then status(boxError or decision); return end
         if not s.Zone or s.Zone~=s.FarmSpot.Zone or s.Traveling or s.Looting
-            or s.BossActive or s.InventoryBusy or s.ForceSell or s.ForceEquip or os.clock()<(s.DodgeUntil or 0) then return end
+            or s.BossActive or s.HopHold or s.InventoryBusy or s.ForceSell or s.ForceEquip or os.clock()<(s.DodgeUntil or 0) then return end
         local _,h,root=ctx.Character()
         if not root or h.Health/h.MaxHealth<0.3 then return end
         local box=selectBox(home,radius,root,plan)
@@ -2822,6 +2905,349 @@ function P.Ready(state)
     return "ready"
 end
 return P
+]====],
+    ["hunting-hop-policy.lua"] = [====[local P={}
+function P.Job(value) return type(value)=="string" and #value>0 and #value<=128 and value:match("^[%w%-_]+$")~=nil end
+function P.Mode(value) return value=="Population" or value=="LowerLevels" or value=="Boss5" end
+function P.Match(mode,observation,level)
+    if mode=="Population" then return true end
+    if mode=="Boss5" then
+        if type(observation.Bosses)~="table" or #observation.Bosses~=5 then return nil end
+        local all=true
+        for _,alive in ipairs(observation.Bosses) do
+            if alive~=0 and alive~=1 then return nil end
+            if alive~=1 then all=false end
+        end
+        return all
+    end
+    if mode=="LowerLevels" then
+        local lower,total=0,0
+        for _,value in ipairs(observation.Levels or {}) do
+            if type(value)~="number" or value<=0 then return nil end
+            total+=1
+            if value<level then lower+=1 end
+        end
+        return total==0 or lower/total>=0.6
+    end
+    return false
+end
+function P.Rank(public,reports,current,visited,now,seats,mode,level)
+    local byId,fresh={},{}
+    for _,report in ipairs(reports or {}) do
+        if P.Job(report.id) and type(report.seenAt)=="number" and now-report.seenAt/1000>=-5 and now-report.seenAt/1000<=20 then
+            fresh[report.id]=report
+            byId[report.id]={id=report.id,playing=report.playing,maxPlayers=report.maxPlayers,ping=9999}
+        end
+    end
+    for _,server in ipairs(public) do if P.Job(server.id) then byId[server.id]=server end end
+    local result={}
+    for id,server in pairs(byId) do
+        local playing,maximum=server.playing,server.maxPlayers
+        if id~=current and type(playing)=="number" and type(maximum)=="number" and playing>=0
+            and maximum-playing>=seats and (not visited[id] or visited[id]<=now) then
+            local report=fresh[id]
+            local matched=report and P.Match(mode,{Bosses=report.bosses,Levels=report.levels},level)
+            result[#result+1]={Id=id,Playing=playing,MaxPlayers=maximum,Ping=tonumber(server.ping) or 9999,
+                Known=report~=nil,Preference=mode=="Population" and 0 or (matched==true and 0 or (matched==false and 2 or 1))}
+        end
+    end
+    table.sort(result,function(a,b)
+        if a.Preference~=b.Preference then return a.Preference<b.Preference end
+        if a.Playing~=b.Playing then return a.Playing<b.Playing end
+        if a.Ping~=b.Ping then return a.Ping<b.Ping end
+        return a.Id<b.Id
+    end)
+    return result
+end
+function P.Rally(trip,ownId,current,place,now,follow,seen)
+    if not follow or type(trip)~="table" or trip.phase~="rally" or trip.placeId~=place
+        or not P.Job(trip.target) or trip.target==current or type(trip.expiresAt)~="number" or trip.expiresAt<=now*1000
+        or type(trip.rallyId)~="string" or #trip.rallyId~=32 or type(trip.members)~="table" then return false end
+    return table.find(trip.members,ownId)~=nil and not seen[trip.rallyId]
+end
+function P.Busy(s)
+    return s.BossActive~=nil or s.Looting==true or s.BoxBusy==true or s.InventoryBusy==true or s.Traveling==true
+end
+function P.CleanVisited(data,now)
+    local list,result={},{}
+    for id,expiry in pairs(type(data)=="table" and data or {}) do
+        if P.Job(id) and type(expiry)=="number" and expiry>now and expiry<now+86400 then list[#list+1]={id,expiry} end
+    end
+    table.sort(list,function(a,b) return a[2]>b[2] end)
+    for index=1,math.min(100,#list) do result[list[index][1]]=list[index][2] end
+    return result
+end
+return P
+]====],
+    ["hunting-hop.lua"] = [====[return function(ctx,options)
+    local s,p,http=ctx.State,ctx.Player,ctx.Http
+    local players=game:GetService("Players")
+    local teleport=game:GetService("TeleportService")
+    local policy=assert(loadstring(readfile("hunting-hop-policy.lua")))()
+    local path="hunting-helper-hop-"..p.UserId..".json"
+    local function now() return workspace:GetServerTimeNow() end
+    local queue=type(queue_on_teleport)=="function" and queue_on_teleport
+        or (type(queueonteleport)=="function" and queueonteleport)
+        or (type(syn)=="table" and syn.queue_on_teleport)
+    local saved={}
+    pcall(function() saved=http:JSONDecode(readfile(path)) end)
+    if type(saved)~="table" then saved={} end
+    local visited=policy.CleanVisited(saved.Visited,now())
+    local seen=policy.CleanVisited(saved.Seen,now())
+    local search,rally,flight=nil,nil,nil
+    local fetching,queued=false,false
+    local operation=0
+    local started=now()
+    s.SessionJobId=game.JobId
+    local function status(value) s.HopStatus=value end
+    local function persist()
+        visited=policy.CleanVisited(visited,now()); seen=policy.CleanVisited(seen,now())
+        pcall(function() writefile(path,http:JSONEncode({Visited=visited,Seen=seen,Search=search,Rally=rally})) end)
+        s.HopSearch=search and {Mode=search.Mode,Attempts=search.Attempts,Limit=search.Limit,Together=search.Together} or nil
+    end
+    local old=saved.Search
+    if type(old)=="table" and policy.Mode(old.Mode) and type(old.Deadline)=="number" and old.Deadline>now()
+        and old.Deadline<now()+1800 and old.Group==s.GroupCode and type(old.Attempts)=="number"
+        and type(old.Limit)=="number" and old.Limit>=1 and old.Limit<=10 and old.Attempts>=0 and old.Attempts<=old.Limit
+        and type(old.Level)=="number" and old.Level>=1 and type(old.NextAt)=="number"
+        and policy.Job(old.Origin) and type(old.Members)=="table"
+        and (old.Attempts==0 or policy.Job(old.LastSource)) then search=old end
+    old=saved.Rally
+    if type(old)=="table" and old.Group==s.GroupCode and type(old.Trip)=="table" and type(old.Attempts)=="number"
+        and old.Attempts>=0 and old.Attempts<3 and type(old.NextAt)=="number"
+        and policy.Rally(old.Trip,p.UserId,game.JobId,game.PlaceId,now(),options.FollowGroupHop,{}) then rally=old end
+    visited[game.JobId]=now()+21600
+    s.HopHold=search~=nil or rally~=nil
+    s.ServerObservation=function(raw)
+        local bosses,levels={},{}
+        local exclude={[p.UserId]=true}
+        if not raw then
+            for _,id in ipairs(search and search.Members or {}) do exclude[id]=true end
+            for _,m in ipairs(ctx.Json("PartyJson").Members or {}) do exclude[tonumber(m.UserId) or 0]=true end
+        end
+        for index=1,5 do
+            local boss=s.BossCatalog[index]
+            local alive=boss and workspace:GetAttribute("BossAlive_"..boss.Id)
+            bosses[index]=alive==true and 1 or (alive==false and 0 or -1)
+        end
+        for _,member in ipairs(players:GetPlayers()) do
+            if raw or not exclude[member.UserId] then levels[#levels+1]=tonumber(member:GetAttribute("Level")) or 0 end
+        end
+        if raw then return {bosses=bosses,levels=levels,playing=#players:GetPlayers(),maxPlayers=players.MaxPlayers} end
+        return {Bosses=bosses,Levels=levels}
+    end
+    local function resume(wasRunning)
+        s.HopDeparting=false
+        s.HopHold=search~=nil or rally~=nil
+        if wasRunning and not s.Destroyed and not s.Active then s:Start() end
+    end
+    local function finish(message,cancel)
+        local previous=search
+        search=nil; s.HopHold=rally~=nil; s.HopDeparting=false; persist(); status(message)
+        if cancel and previous and previous.Together and previous.TripId then
+            task.spawn(function() s.PostGroupTrip("cancel",{tripId=previous.TripId}) end)
+        end
+    end
+    local function candidates(mode,seats,level)
+        local public,cursor={},nil
+        for page=1,1 do
+            local data,err=s.ReadServerPage(cursor)
+            if not data then return nil,err end
+            if s.Destroyed then return nil,"สคริปต์หยุดแล้ว" end
+            for _,server in ipairs(data.data) do public[#public+1]=server end
+            cursor=data.nextPageCursor
+            if not cursor or #public>=100 then break end
+            task.wait(0.25)
+        end
+        return policy.Rank(public,s.ServerReports,game.JobId,visited,now(),seats,mode,level)
+    end
+    s.PreviewServers=function()
+        if fetching or flight then return end
+        fetching=true; status("กำลังอ่านรายชื่อเซิร์ฟเวอร์")
+        task.spawn(function()
+            local seats=options.HopTogether and math.max(1,s.Registry and s.Registry.Count or #(ctx.Json("PartyJson").Members or {})) or 1
+            local ok,list,err=pcall(candidates,"Population",seats,s.GetFarmLevel())
+            fetching=false
+            if not ok or not list then status("ดูเซิร์ฟเวอร์ไม่ได้: "..tostring(err or list)); return end
+            s.HopCandidates=list
+            status("พบ "..#list.." เซิร์ฟที่มีที่ว่างอย่างน้อย "..seats.." คน • ยังไม่ย้าย")
+        end)
+    end
+    s.RequestHop=function(mode)
+        if not policy.Mode(mode) or fetching or flight or search or rally then return end
+        if mode~="Population" and type(queue)~="function" then
+            status("Executor ไม่มี queue_on_teleport • ค้นหาต่อหลังย้ายอัตโนมัติไม่ได้"); return
+        end
+        fetching=true
+        operation+=1
+        local generation=operation
+        task.spawn(function()
+            if operation~=generation then fetching=false; return end
+            local together=options.HopTogether
+            local trip
+            if together then
+                local err
+                trip,err=s.PostGroupTrip("begin",{mode=mode,limit=mode=="Population" and 1 or options.HopMaxAttempts})
+                if not trip then fetching=false; status("เริ่มสำรวจทีมไม่ได้: "..tostring(err)); return end
+            end
+            if operation~=generation then
+                fetching=false
+                if trip then s.PostGroupTrip("cancel",{tripId=trip.id}) end
+                return
+            end
+            if s.Destroyed then fetching=false; return end
+            search={Mode=mode,Together=together,TripId=trip and trip.id,Members=trip and trip.members or {p.UserId},
+                Attempts=0,Limit=mode=="Population" and 1 or options.HopMaxAttempts,Deadline=now()+600,
+                Origin=game.JobId,Group=s.GroupCode,Level=s.GetFarmLevel(),NextAt=now()}
+            fetching=false; s.HopHold=true; persist()
+            status(together and "จอนี้ออกสำรวจ • สมาชิกอื่นรอเซิร์ฟเดิม" or "เตรียมย้ายเฉพาะจอนี้")
+        end)
+    end
+    s.CancelHop=function()
+        operation+=1
+        local incoming=rally and rally.Trip or s.GroupTrip
+        if incoming and incoming.phase=="rally" and incoming.rallyId then seen[incoming.rallyId]=now()+21600 end
+        local orphan=not search and incoming and incoming.scout==p.UserId and incoming.phase=="scouting"
+        rally=nil
+        finish(flight and "หยุดค้นหาต่อแล้ว • การย้ายที่เริ่มแล้วอาจเสร็จต่อ" or "หยุดค้นหาแล้ว • ยังอยู่เซิร์ฟปัจจุบัน",true)
+        if orphan then task.spawn(function() s.PostGroupTrip("cancel",{tripId=incoming.id}) end) end
+    end
+    s.CallTeamHere=function()
+        local trip=s.GroupTrip
+        if fetching or not trip or trip.scout~=p.UserId then status("จอที่สำรวจเป็นผู้เรียกทีมครับ"); return end
+        fetching=true
+        task.spawn(function()
+            local result,err=s.PostGroupTrip("rally",{tripId=trip.id})
+            fetching=false
+            if result then finish("เรียกทีมมายังเซิร์ฟนี้แล้ว",false)
+            else status("เรียกทีมไม่ได้: "..tostring(err)) end
+        end)
+    end
+    local bootstrap=[[
+task.wait(2)
+local e=getgenv()
+if e.HuntingHelperBootingJobId==game.JobId or (e.HuntingHelper and not e.HuntingHelper.Destroyed and e.HuntingHelper.SessionJobId==game.JobId) then return end
+e.HuntingHelperBootingJobId=game.JobId
+local ok,err=pcall(function()
+    local downloaded,src=pcall(function() return game:HttpGet("https://raw.githubusercontent.com/ohm675/hunting-helper/main/HuntingHelper.txt?v="..os.time()) end)
+    if not downloaded then src=readfile("HuntingHelper.txt")
+    elseif type(writefile)=="function" then pcall(writefile,"HuntingHelper.txt",src) end
+    assert(loadstring(src))()
+end)
+e.HuntingHelperBootingJobId=nil
+if not ok then warn("Hunting Helper queued resume: "..tostring(err)) end
+]]
+    local function failed(message)
+        local previous=flight
+        if not previous then return end
+        flight=nil
+        if rally then rally.Attempts+=1; rally.NextAt=now()+10; seen[rally.Trip.rallyId]=nil end
+        if search then search.NextAt=now()+10 end
+        persist(); resume(previous.Running)
+        status("ย้ายไม่สำเร็จ: "..message.." • รอก่อนลองเซิร์ฟถัดไป")
+    end
+    table.insert(s.Connections,teleport.TeleportInitFailed:Connect(function(who,_,message,placeId)
+        if who==p and placeId==game.PlaceId then failed(tostring(message)) end
+    end))
+    local function depart(target)
+        if flight or policy.Busy(s) then status("รอสู้บอส/เก็บของ/เดินทางให้เสร็จก่อน Hop"); return false end
+        if not queued and type(queue)=="function" then
+            local ok=pcall(queue,bootstrap)
+            if not ok then rally=nil; finish("ตั้งรันต่อหลังย้ายไม่สำเร็จ • พักการย้าย",true); return false end
+            queued=true
+        end
+        s.HopDeparting=true
+        local wasRunning=s.Active
+        if wasRunning then s:Stop(true) else ctx.SetAuto(false) end
+        flight={At=now(),Running=wasRunning,Target=target}
+        visited[target]=now()+21600
+        persist(); status("กำลังย้ายไปเซิร์ฟ "..target:sub(1,8))
+        local ok,err=pcall(function() teleport:TeleportToPlaceInstance(game.PlaceId,target,p) end)
+        if not ok then failed(tostring(err)) end
+        return ok
+    end
+    local function tick()
+        if flight then
+            if now()-flight.At>45 then
+                local running=flight.Running; flight=nil; rally=nil
+                finish("ไม่เห็นผลการย้ายภายใน 45 วินาที • พัก Hop เพื่อไม่ส่งซ้ำ",true)
+                resume(running)
+            end
+            return
+        end
+        if fetching then return end
+        local trip=s.GroupTrip
+        if policy.Rally(trip,p.UserId,game.JobId,game.PlaceId,now(),options.FollowGroupHop,seen) and not rally then
+            rally={Trip=trip,Group=s.GroupCode,Attempts=0,NextAt=now()}
+            s.HopHold=true; persist()
+        end
+        if rally then
+            if rally.Group~=s.GroupCode or rally.Trip.expiresAt<=now()*1000 or rally.Attempts>=3 then
+                rally=nil; s.HopHold=search~=nil; persist(); status("เรียกทีมหมดเวลาหรือย้ายไม่สำเร็จ • กดเรียกทีมใหม่ได้"); return
+            end
+            if now()<(rally.NextAt or 0) then return end
+            s.HopDeparting=true
+            if policy.Busy(s) then status("ทีมเรียกแล้ว • รอเก็บของ/สู้บอสให้เสร็จก่อนตาม"); return end
+            seen[rally.Trip.rallyId]=now()+21600
+            depart(rally.Trip.target)
+            return
+        end
+        if not search then
+            s.HopHold=false
+            if trip and trip.phase=="rally" and trip.target==game.JobId and type(trip.members)=="table" then
+                for _,id in ipairs(trip.members) do
+                    if not s.IsScriptPeer(id) then s.HopHold=true; status("รอทีมเข้าเซิร์ฟใหม่ครบก่อนล่าบอส/เปิดกล่อง"); break end
+                end
+            end
+            if trip and trip.phase=="scouting" and trip.scout~=p.UserId then status("อีกจอกำลังสำรวจ • ฟาร์มรอในเซิร์ฟเดิม") end
+            return
+        end
+        if search.Group~=s.GroupCode or search.Deadline<now() then finish("หมดเวลาค้นหาหรือรหัสกลุ่มเปลี่ยน",true); return end
+        if search.Together and trip and trip.id==search.TripId and trip.phase=="cancelled" then finish("ยกเลิกสำรวจทีมแล้ว",false); return end
+        local arrived=search.Attempts>0 and game.JobId~=search.LastSource
+        local matched
+        if arrived or search.Mode=="Boss5" then matched=policy.Match(search.Mode,s.ServerObservation(false),search.Level) end
+        if matched==true then
+            local current=search
+            if current.Together then
+                if not s.IsScriptPeer(p.UserId) then status("พบเงื่อนไขแล้ว • รอเชื่อมกลุ่มเพื่อเรียกทีม"); return end
+                local result,err=s.PostGroupTrip("rally",{tripId=current.TripId})
+                if search~=current then
+                    if result then s.PostGroupTrip("cancel",{tripId=current.TripId}) end
+                    return
+                end
+                if not result then status("พบเงื่อนไขแล้ว • เรียกทีมไม่สำเร็จ: "..tostring(err)); return end
+            end
+            finish(current.Together and "เจอเซิร์ฟตรงเงื่อนไขแล้ว • เรียกทีมตามมา" or "เจอเซิร์ฟตรงเงื่อนไขแล้ว",false)
+            if trip or s.GroupTrip then s.HopHold=true end
+            return
+        end
+        if (arrived or search.Mode=="Boss5") and matched==nil and now()-started<15 then status("รอข้อมูลเลเวล/บอสจากเซิร์ฟใหม่"); return end
+        if (arrived or search.Mode=="Boss5") and matched==nil then finish("เกมยังไม่ส่งข้อมูลที่ต้องตรวจ • พักค้นหา",true); return end
+        if search.Attempts>=search.Limit then finish("ลองครบ "..search.Limit.." เซิร์ฟแล้ว ยังไม่ตรงเงื่อนไข • หยุดค้นหา",true); return end
+        if now()<(search.NextAt or 0) then status("รอช่วงพักก่อนสำรวจเซิร์ฟถัดไป"); return end
+        if policy.Busy(s) then status("รอจบบอส/เก็บของ ก่อนออกสำรวจ"); return end
+        local current=search
+        fetching=true
+        local ok,list,err=pcall(candidates,current.Mode,current.Together and #current.Members or 1,current.Level)
+        fetching=false
+        if search~=current or s.Destroyed then return end
+        if not ok or not list or #list==0 then finish("หาเซิร์ฟไม่ได้: "..tostring(err or (not ok and list) or "ไม่มีเซิร์ฟที่ว่างพอ"),true); return end
+        if policy.Busy(s) then status("รอจบงานปัจจุบันก่อนย้าย • ยังไม่นับเป็นการลอง"); return end
+        s.HopCandidates=list
+        current.Attempts+=1; current.LastSource=game.JobId; current.NextAt=now()+30
+        persist(); depart(list[1].Id)
+    end
+    s.HopReady=true
+    persist()
+    task.spawn(function()
+        while not s.Destroyed do
+            local ok,err=pcall(tick)
+            if not ok then status("Hop ผิดพลาด: "..tostring(err):sub(-110)) end
+            task.wait(0.5)
+        end
+    end)
+end
 ]====]
 }
 local nativeLoadstring, nativeReadfile = loadstring, readfile
