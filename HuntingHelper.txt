@@ -87,6 +87,9 @@ local function saveStatus()
             Looting = state.Looting, LootRemaining = state.LootRemaining,
             Team = state.Team, BoxStatus = state.BoxStatus, BoxPending = state.BoxPending,
             BoxEncounter = state.BoxEncounter, BoxesOpened = state.BoxesOpened, LuckyRemaining = state.LuckyRemaining,
+            BoxEnemyCount=state.BoxEnemyCount,BoxReserved=state.BoxReserved,BoxBusy=state.BoxBusy,
+            RegistryStatus=state.RegistryStatus,RegistryCount=state.Registry and state.Registry.Count,
+            PartyActions=state.PartyActions,PartyError=state.PartyError,LastPartyNotice=state.LastPartyNotice,
             LastBoxTrigger = state.LastBoxTrigger, LastBoxNotice = state.LastBoxNotice,
             GameAutoSkill = player:GetAttribute("AutoSkill"), GameAutoSkillError = state.GameAutoSkillError,
             FarmSpot = state.FarmSpot,
@@ -215,6 +218,10 @@ local function moveTo(point, token)
     local c, h, r = character()
     if not c then return false end
     h.Sit=false
+    if state.BossTravel and not state.InBossRoute then
+        local handled,result=state.BossTravel(destination,token)
+        if handled then return result end
+    end
     if not walkBeforeWarp(target,token) then return false end
     check(token)
     c,h,r=character()
@@ -254,6 +261,15 @@ local function moveTo(point, token)
     assert(arrived,"Travel was rejected; paused")
     return true
 end
+local originalMoveTo=moveTo
+local movementDepth=0
+moveTo=function(point,token)
+    movementDepth+=1; state.Traveling=true
+    local ok,result=pcall(originalMoveTo,point,token)
+    movementDepth-=1; state.Traveling=movementDepth>0
+    if not ok then error(result,0) end
+    return result
+end
 local function prepareFarm(zone, token)
     local settings = json("BotJson")
     local only = {}
@@ -264,7 +280,12 @@ local function prepareFarm(zone, token)
             only[spawn.Id] = true
         end
     end
-    assert(next(only), "No suitable normal monsters in this zone")
+    if not next(only) then
+        setAuto(false)
+        state.Zone=nil
+        status("Party level changed; selecting a lower field")
+        return false
+    end
     settings.Only = only
     settings.FixedArea = true
     settings.Range = CONFIG.FarmRadius
@@ -283,6 +304,7 @@ local function prepareFarm(zone, token)
     remotes.SetBotSettings:FireServer(settings)
     sleep(0.5, token)
     setAuto(true)
+    return true
 end
 local function equipmentSnapshot()
     return tostring(player:GetAttribute("EquipJson")) .. "|" .. tostring(player:GetAttribute("WeaponId"))
@@ -426,6 +448,7 @@ local ui
 local function run(token)
     while state.Active and state.Generation == token do
         check(token)
+        if state.BoxBusy then saveStatus(); sleep(0.1,token); continue end
         if not character() or player:GetAttribute("HuntRespawnWaiting") == true then death(token) end
         if state.GetTeamPlan and not state.GetTeamPlan().Ready then
             setAuto(false)
@@ -439,9 +462,12 @@ local function run(token)
         local maximum = tonumber(player:GetAttribute("BagSlotsMax")) or 120
         if state.ForceSell or used >= maximum-CONFIG.ReservedSlots or used/maximum*100 >= CONFIG.SellAtPercent then
             state.ForceSell = false
-            if not sellEquipment(token) then state.ForceSell=true; sleep(1,token); continue end
+            state.InventoryBusy=true
+            local sold=sellEquipment(token)
+            state.InventoryBusy=false
+            if not sold then state.ForceSell=true; sleep(1,token); continue end
         end
-        if state.ForceEquip then state.ForceEquip = false; equipBest(token) end
+        if state.ForceEquip then state.ForceEquip = false; state.InventoryBusy=true; equipBest(token); state.InventoryBusy=false end
         if state.ForceCollect and state.CollectBossLoot then
             local room=state.ForceCollect
             state.ForceCollect=nil
@@ -450,17 +476,27 @@ local function run(token)
         end
         if state.PartyFollow and state.PartyFollow(token) then saveStatus(); sleep(0.5,token); continue end
         if state.BossController then state.BossController(token) end
+        farmLevel=state.GetFarmLevel and state.GetFarmLevel() or tonumber(player:GetAttribute("Level")) or 1
+        if state.UpdateProgression then state.UpdateProgression(farmLevel) end
         local zone = assert(pickZone(farmLevel), "No suitable zone found")
         local _, _, root = character()
         if root and (state.Zone ~= zone.Id or not inZone(root, zone)) then
             status("Traveling to " .. zone.Data.DisplayName)
             if moveTo(positionForZone(zone), token) then
+                local currentLevel=state.GetFarmLevel and state.GetFarmLevel() or tonumber(player:GetAttribute("Level")) or 1
+                if state.UpdateProgression then state.UpdateProgression(currentLevel) end
+                local currentZone=pickZone(currentLevel)
+                if not currentZone or currentZone.Id~=zone.Id then
+                    state.Zone=nil
+                    status("Party changed during travel; choosing the shared field")
+                    continue
+                end
                 local refined=positionForZone(zone)
                 local _,_,arrived=character()
                 if arrived and (Vector2.new(arrived.Position.X-refined.X,arrived.Position.Z-refined.Z)).Magnitude>3 then
                     if not moveTo(refined,token) then continue end
                 end
-                prepareFarm(zone, token)
+                if not prepareFarm(zone, token) then continue end
                 state.Zone = zone.Id
                 status("Farming: " .. zone.Data.DisplayName .. " | " .. zone.Data.LevelText
                     ..(state.ProgressionBlock and " | Waiting for "..state.ProgressionBlock.Label or ""))
@@ -479,6 +515,7 @@ function state:Stop(internal)
     setAuto(false)
     self.ForceSell = false
     self.ForceEquip = false
+    self.InventoryBusy=false
     self.LootTarget = nil
     self.Looting = false
     if self.BoxCancel then self.BoxCancel() end
@@ -676,7 +713,10 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
         s.DodgeFailure=nil
         table.clear(casts)
         local finished,err=pcall(function()
-            if not ctx.MoveTo(Vector3.new(zone.X+24,zone.Y+5,zone.Z+12),token) then return end
+            if not ctx.MoveTo(Vector3.new(zone.X+24,zone.Y+5,zone.Z+12),token) then
+                blocked[boss.Id]=workspace:GetServerTimeNow()+15
+                return
+            end
             local model
             for _=1,20 do
                 model=alive(boss.Id)
@@ -882,6 +922,10 @@ if CONFIG.StartEnabled and state.Options.ResumeOnLoad and state.Options.LastRunn
     assert(loadstring(readfile("hunting-progression.lua")))()(ctx)
     assert(loadstring(readfile("hunting-gear-keep.lua")))()(ctx,options)
     assert(loadstring(readfile("hunting-skills.lua")))()(ctx,options)
+    s.WalkTo=assert(loadstring(readfile("hunting-walk.lua")))()(ctx)
+    assert(loadstring(readfile("hunting-room-travel.lua")))()(ctx)
+    assert(loadstring(readfile("hunting-party-online.lua")))()(ctx,options)
+    assert(loadstring(readfile("hunting-boxes.lua")))()(ctx,options)
 end
 ]====],
     ["hunting-geometry.lua"] = [====[-- Geometry from the BossFx warning payload, in the horizontal plane.
@@ -1132,32 +1176,14 @@ function P.Team(members,preferred)
     end
     return {Level=floor or 1,Ready=ready,LeaderId=leader and leader.Id}
 end
-function P.Box(state,now)
-    if not state.Enabled then return "off" end
-    if not state.Leader then return "follower" end
-    if not state.GroupReady then return "party_wait" end
-    if state.Pending then return "await_result" end
-    if state.Danger then return "fight_first" end
-    if (state.LuckyUntil or 0)>now then return "lucky_hold" end
-    return "ready"
-end
 return P
 ]====],
     ["hunting-team-box.lua"] = [====[return function(ctx,options,persist)
     local s,p,r=ctx.State,ctx.Player,ctx.Remotes
     local Players=game:GetService("Players")
-    local Tags=game:GetService("CollectionService")
     local Policy=assert(loadstring(readfile("hunting-policy.lua")))()
-    local nativeSetting=ctx.Json("SettingsJson").AutoOpenBox
     local cachedTeam,teamAt=nil,0
     local partySignature,partyChangedAt=nil,os.clock()
-    local pending,encounter,boxError=nil,nil,nil
-    local requestSent=false
-    local inferredLuckyUntil=0
-    s.BoxCancel=function()
-        if pending and requestSent then boxError="Stopped before box result; check enemy before retry" end
-        pending=nil; requestSent=false; s.BoxPending=false
-    end
     local cacheSignature=nil
     local function rootOf(member)
         local c=member and member.Character
@@ -1217,7 +1243,7 @@ return P
     end
     s.GetFarmLevel=function() return team().Level end
     local function luckyUntil()
-        local untilTime=inferredLuckyUntil
+        local untilTime=0
         for _,member in ipairs(team().Members) do
             if member.Player then
                 local buffs=ctx.Decode(member.Player:GetAttribute("BuffsJson"))
@@ -1238,24 +1264,6 @@ return P
         end
         s.BoxStatus=text
     end
-    local function nearDanger(point,radius,baseline)
-        local folder=workspace:FindFirstChild("Monsters")
-        for _,model in ipairs(folder and folder:GetChildren() or {}) do
-            if model:IsA("Model") and model.PrimaryPart and (tonumber(model:GetAttribute("HP")) or 0)>0
-                and (not baseline or not baseline[model]) then
-                local id=tostring(model:GetAttribute("MonsterId") or "")
-                local danger=model:GetAttribute("IsMiniBoss")==true or model:GetAttribute("IsBoss")==true
-                    or id:find("halloween_pumpkin",1,true) or model.Name:lower():find("spider",1,true)
-                if danger and (model.PrimaryPart.Position-point).Magnitude<radius then return model end
-            end
-        end
-    end
-    table.insert(s.Connections,r.Notify.OnClientEvent:Connect(function(message)
-        if pending then
-            s.LastBoxNotice=tostring(message)
-            pcall(function() writefile("hunting-box-notice.txt",s.LastBoxNotice) end)
-        end
-    end))
     local function tuneSupport(on)
         local settings=ctx.Json("BotJson")
         settings.Mode=on and "support" or "fight"
@@ -1272,7 +1280,6 @@ return P
     s.PartyFollow=function(token)
         local plan=team()
         if plan.IsLeader or #plan.Members<=1 then return false end
-        boxStatus("Follower: main character opens boxes")
         local ownRoot=rootOf(p)
         local leaderRoot=rootOf(plan.Leader)
         if not ownRoot then ctx.SetAuto(false); ctx.Status("Waiting for own character"); return true end
@@ -1319,156 +1326,6 @@ return P
         s.Zone=nil
         ctx.Status((plan.Healer and "Healing/following " or "Assisting ")..plan.Leader.Name.." | Team Lv."..plan.Level)
         return true
-    end
-    local function suppressNativeBoxes()
-        if not options.SmartBoxes then return end
-        local settings=ctx.Json("SettingsJson")
-        if settings.AutoOpenBox~=false then
-            settings.AutoOpenBox=false
-            r.SetSettings:FireServer(settings)
-        end
-    end
-    suppressNativeBoxes()
-    local restore=s.CleanupExtra
-    s.CleanupExtra=function()
-        if restore then restore() end
-        if nativeSetting~=nil then
-            local settings=ctx.Json("SettingsJson"); settings.AutoOpenBox=nativeSetting
-            pcall(function() r.SetSettings:FireServer(settings) end)
-        end
-    end
-    local function fightEncounter(model,token)
-        local id=tostring(model:GetAttribute("MonsterId") or "")
-        local room=s.Zone
-        if not room then return end
-        s.BoxEncounter=id
-        s.BossActive={Id=id,Room=room}
-        local settings=ctx.Json("BotJson")
-        settings.Mode="fight"; settings.FixedArea=false; settings.AttackLeader=true
-        settings.SkipBoss=false; settings.SkipLeader=false; settings.OpenBoxes=false
-        settings.Exclude=settings.Exclude or {}; settings.Exclude[id]=nil
-        r.SetBotSettings:FireServer(settings)
-        local started=os.clock()
-        while model.Parent and model.PrimaryPart and (tonumber(model:GetAttribute("HP")) or 0)>0 do
-            ctx.Check(token)
-            local _,h=ctx.Character()
-            if not h then return end
-            boxStatus("Fight spawned enemy; boxes locked")
-            if h.Health/h.MaxHealth<0.2 or os.clock()-started>180 then
-                boxError="Spawned enemy remains: boxes locked"
-                return
-            end
-            if os.clock()>=(s.DodgeUntil or 0) then
-                ctx.SetAuto(true)
-                local target=p:FindFirstChild("CurrentTarget")
-                if target and target.Value~=model then target.Value=model end
-            else ctx.SetAuto(false) end
-            ctx.Sleep(0.2,token)
-        end
-        s.BoxEncounter=nil
-        s.BossActive=nil
-        s.Zone=nil
-    end
-    s.ShouldHuntBoss=function()
-        local plan=team()
-        return plan.IsLeader and not pending and not encounter and not boxError and luckyUntil()<=workspace:GetServerTimeNow() and plan.GroupReady
-    end
-    s.BoxController=function(token)
-        local plan=team()
-        if not s.Zone or s.Looting then return end
-        local _,_,root=ctx.Character()
-        if not root then return end
-        if encounter then
-            if encounter.Parent and (tonumber(encounter:GetAttribute("HP")) or 0)>0 then fightEncounter(encounter,token) end
-            if not encounter.Parent or (tonumber(encounter:GetAttribute("HP")) or 0)<=0 then encounter=nil; boxError=nil; s.BoxEncounter=nil; s.BossActive=nil end
-            return
-        end
-        if boxError then boxStatus(boxError); return end
-        local danger=nearDanger(root.Position,45)
-        local untilTime=luckyUntil()
-        s.LuckyRemaining=math.max(0,math.ceil(untilTime-workspace:GetServerTimeNow()))
-        local decision=Policy.Box({Enabled=options.SmartBoxes,Leader=plan.IsLeader,GroupReady=plan.GroupReady,
-            Pending=pending~=nil,Danger=danger~=nil,LuckyUntil=untilTime},workspace:GetServerTimeNow())
-        if decision~="ready" then boxStatus(decision); return end
-        suppressNativeBoxes()
-        local selected,expires
-        for _,box in ipairs(Tags:GetTagged("LootBox")) do
-            if box:IsA("BasePart") and box.Parent and not box:GetAttribute("OpenTitle") then
-                local owner=tonumber(box:GetAttribute("OwnerUserId")) or 0
-                local allowed=owner==0 or owner==p.UserId or (tonumber(box:GetAttribute("FreeAt")) or 0)<=workspace:GetServerTimeNow()
-                for _,member in ipairs(plan.Members) do if owner==member.Id then allowed=true end end
-                local deadline=(tonumber(box:GetAttribute("SpawnedAt")) or workspace:GetServerTimeNow())+60
-                if allowed and deadline-workspace:GetServerTimeNow()>4 and (box.Position-root.Position).Magnitude<65
-                    and (not expires or deadline<expires) then selected,expires=box,deadline end
-            end
-        end
-        if not selected then boxStatus("Waiting for a box"); return end
-        local baseline={}
-        for _,model in ipairs(workspace.Monsters:GetChildren()) do baseline[model]=true end
-        local point=selected.Position
-        local buffsBefore={}
-        for _,buff in pairs(ctx.Json("BuffsJson")) do buffsBefore[buff.Id]=buff.EndsAt end
-        pending=selected
-        requestSent=false
-        s.BoxPending=true
-        boxStatus("Opening one box")
-        if not ctx.MoveTo(point+Vector3.new(0,4,0),token) then
-            pending=nil; s.BoxPending=false; s.Zone=nil
-            return
-        end
-        if not selected.Parent then pending=nil; s.BoxPending=false; return end
-        if nearDanger(point,50) or not team().GroupReady then
-            pending=nil; s.BoxPending=false
-            boxStatus("Wait: nearby enemy or party regrouping")
-            return
-        end
-        -- Exactly one request. Unknown responses never cause an automatic retry.
-        local prompt=selected:FindFirstChildWhichIsA("ProximityPrompt",true)
-        s.LastBoxTrigger=prompt and "prompt" or "remote"
-        requestSent=true
-        if prompt then
-            if type(fireproximityprompt)=="function" then
-                fireproximityprompt(prompt)
-            else
-                prompt:InputHoldBegin()
-                ctx.Sleep(math.max(0.1,prompt.HoldDuration+0.05),token)
-                prompt:InputHoldEnd()
-            end
-        else
-            r.OpenLootBox:FireServer(selected)
-        end
-        s.BoxesOpened=(s.BoxesOpened or 0)+1
-        boxStatus("One request sent; waiting for result")
-        local started=os.clock()
-        local acknowledgedAt=nil
-        while os.clock()-started<9 do
-            ctx.Check(token)
-            local spawned=nearDanger(point,90,baseline)
-            if spawned then encounter=spawned; boxStatus("Spawn detected; no more boxes"); break end
-            local acknowledged=not selected.Parent or selected:GetAttribute("OpenTitle")~=nil or luckyUntil()>workspace:GetServerTimeNow()
-            local newBuff
-            for _,buff in pairs(ctx.Json("BuffsJson")) do
-                if tostring(buff.Id):match("^box_") and buff.EndsAt~=buffsBefore[buff.Id] then newBuff=buff.Id end
-            end
-            local title=tostring(selected:GetAttribute("OpenTitle") or ""):upper()
-            if newBuff=="box_lucky" or title:find("LUCKY DROP",1,true) then
-                if luckyUntil()<=workspace:GetServerTimeNow() then inferredLuckyUntil=workspace:GetServerTimeNow()+60 end
-                boxStatus("Lucky Drop: keep buff until expiry")
-            end
-            acknowledged=acknowledged or newBuff~=nil
-            if acknowledged then acknowledgedAt=acknowledgedAt or os.clock() end
-            if acknowledgedAt and os.clock()-acknowledgedAt>(newBuff and 0.6 or 2.5) then break end
-            ctx.Sleep(0.15,token)
-        end
-        pending=nil
-        requestSent=false
-        s.BoxPending=false
-        if not acknowledgedAt and not encounter then boxError="Unknown box result; opening paused" end
-        if encounter then fightEncounter(encounter,token) end
-        s.Zone=nil -- Restore normal farm settings after the one-box transaction.
-    end
-    s.ResetBoxPause=function()
-        if not pending and not encounter then boxError=nil end
     end
     s.Policy=Policy
 end
@@ -1520,7 +1377,7 @@ return B
 ]====],
     ["hunting-settings.lua"] = [====[local S={}
 S.Defaults={Bosses=false,Gorilla=true,Tiger=true,Pharaoh=true,Dragon=true,Turtle=true,
-    AutoStats=false,Primary="DEX",AutoBoost=false,Dodge=true,SmartBoxes=true,
+    AutoStats=false,Primary="DEX",AutoBoost=false,Dodge=true,SmartBoxes=true,AutoParty=true,
     ResumeOnLoad=true,LastRunning=true,Collapsed=false,Tab="Farm",UIX=0.025,UIY=0.08,
     FarmRadius=40,FarmLayoutVersion=1,SellAtPercent=95,RestoreGameSkill=false,GameAutoSkill=false,
     KeepTier5=true,KeepRollPercent=80,SkillPlanEnabled=false,SkillOrders={}}
@@ -1678,7 +1535,7 @@ return S
         return n
     end
     local farm=page("Farm")
-    optionCheck(farm,"SmartBoxes","เปิดกล่องทีละใบ","รอเฉพาะ Lucky Drop หรือศัตรูจากกล่อง")
+    optionCheck(farm,"SmartBoxes","เปิดกล่องต่อเนื่อง • ศัตรูไม่เกิน 3 ตัว","ตรวจทุก 0.1 วิ • เปิดทับ Lucky Drop • เดินหาในวงฟาร์ม")
     optionCheck(farm,"AutoBoost","ใช้ยา EXP / Drop ที่มีอยู่","ใช้ของในกระเป๋า ไม่ซื้อยาเพิ่ม")
     optionCheck(farm,"ResumeOnLoad","เริ่มต่อเมื่อโหลดสคริปต์ใหม่","จำสถานะเริ่ม/พักล่าสุดของไอดีนี้")
     selectRow(farm,"FarmRadius","ระยะฟาร์ม • จุดฝั่งขวาใกล้ Leader",{30,40,50,70,100})
@@ -1761,13 +1618,29 @@ return S
         skillLabel.Text=s.GameAutoSkillError or (s.GameAutoSkillPending and "กำลังรอเกมยืนยัน..." or "แต้มสกิลเหลือ "..tostring(p:GetAttribute("SkillPoints") or 0).." • จำตัวเลือกแยกตามไอดี")
     end
     local team=page("Team")
+    optionCheck(team,"AutoParty","เชิญและรับปาร์ตี้อัตโนมัติ","เฉพาะคนที่รันสคริปต์ รหัสกลุ่มตรงกัน และอยู่เซิร์ฟเวอร์เดียวกัน")
+    local groupCard=card(team,128)
+    text(groupCard,"รหัสกลุ่มส่วนตัว • ใส่รหัสเดียวกันทุกเครื่อง",12,6,440,24,13,C.Muted)
+    local groupInput=make("TextBox",{Name="GroupCode",Text=s.GroupCode or "",ClearTextOnFocus=false,
+        Font=Enum.Font.Code,TextSize=12,TextColor3=C.Text,BackgroundColor3=C.Row,BorderSizePixel=0,
+        Position=UDim2.fromOffset(12,35),Size=UDim2.fromOffset(440,30)},groupCard)
+    corner(groupInput,6)
+    button(groupCard,"ใช้รหัสนี้",12,72,140,28,function() s.SetGroupCode(groupInput.Text); ui:Refresh() end,true)
+    button(groupCard,"คัดลอกรหัส",160,72,140,28,function() s.CopyGroupCode() end)
+    button(groupCard,"สร้างกลุ่มใหม่",308,72,144,28,function()
+        s.NewGroupCode(); groupInput.Text=s.GroupCode; ui:Refresh()
+    end)
+    text(groupCard,"เก็บรหัสไว้ส่วนตัว • เครื่องใหม่วางรหัสแล้วกดใช้รหัสนี้ครั้งเดียว",12,105,440,18,10,C.Muted)
+    local registryCard=card(team,54)
+    local registryLabel=text(registryCard,"",12,7,440,40,12,C.Accent)
     local partyCard=card(team,122)
     local partyLabel=text(partyCard,"",12,10,440,100,14,C.Text)
     local boxCard=card(team,80)
     local boxLabel=text(boxCard,"",12,8,440,66,13,C.Muted)
     local hint=card(team,66)
-    text(hint,"พระเข้า Support และตามตัวหลัก\nใช้สคริปต์เดียวกันในทุกจอ แล้วเข้าปาร์ตี้เดียวกัน",12,8,440,50,12,C.Muted)
+    text(hint,"พระเข้า Support และตามตัวหลัก\nตัวหลักเปิดกล่องให้ทั้งทีม • สมาชิกอื่นไม่เปิดแข่งกัน",12,8,440,50,12,C.Muted)
     ui.Dynamic[#ui.Dynamic+1]=function()
+        registryLabel.Text=s.RegistryStatus or "กำลังเชื่อมต่อกลุ่ม"
         local t=s.Team or {}
         partyLabel.Text="สมาชิก "..tostring(t.Count or 1).." คน   •   เลเวลต่ำสุด "..tostring(t.Level or p:GetAttribute("Level") or 1)
             .."\nหน้าที่: "..tostring(t.Role or "Main").."\nตัวหลัก: "..tostring(t.LeaderName or p.Name)
@@ -2454,6 +2327,501 @@ return P
         end
     end)
 end
+]====],
+    ["hunting-walk.lua"] = [====[return function(ctx)
+    local paths=game:GetService("PathfindingService")
+    local function flatDistance(a,b) return Vector2.new(a.X-b.X,a.Z-b.Z).Magnitude end
+    return function(point,token,options)
+        options=options or {}
+        ctx.Check(token)
+        local _,h,root=ctx.Character()
+        if not root then return false end
+        local function allowed(position)
+            return not options.Anchor or flatDistance(position,options.Anchor)<=(options.Radius or 40)
+        end
+        if not allowed(point) then return false end
+        local path=paths:CreatePath({AgentRadius=2.5,AgentHeight=5,AgentCanJump=true,WaypointSpacing=5})
+        local ok=pcall(function() path:ComputeAsync(root.Position,point) end)
+        ctx.Check(token)
+        if not ok or path.Status~=Enum.PathStatus.Success then return false end
+        local waypoints=path:GetWaypoints()
+        for _,waypoint in ipairs(waypoints) do if not allowed(waypoint.Position) then return false end end
+        local deadline=os.clock()+(options.Timeout or 20)
+        for _,waypoint in ipairs(waypoints) do
+            local _,currentHumanoid,current=ctx.Character()
+            if not current then return false end
+            if options.Cancel and options.Cancel() then currentHumanoid:MoveTo(current.Position); return false end
+            if waypoint.Action==Enum.PathWaypointAction.Jump then currentHumanoid.Jump=true end
+            currentHumanoid:MoveTo(waypoint.Position)
+            local progressAt,best=os.clock(),math.huge
+            while true do
+                ctx.Check(token)
+                local _,humanoid,now=ctx.Character()
+                if not now then return false end
+                if not allowed(now.Position) or (options.Cancel and options.Cancel()) or os.clock()>deadline then
+                    humanoid:MoveTo(now.Position); return false
+                end
+                local distance=flatDistance(now.Position,waypoint.Position)
+                if distance<=2.8 then break end
+                if distance<best-0.4 then best=distance; progressAt=os.clock() end
+                if os.clock()<(ctx.State.DodgeUntil or 0) then humanoid:MoveTo(now.Position); return false end
+                if os.clock()-progressAt>2.5 then humanoid:MoveTo(now.Position); return false end
+                ctx.Sleep(0.1,token)
+            end
+        end
+        local _,humanoid,now=ctx.Character()
+        if not now then return false end
+        humanoid:MoveTo(now.Position)
+        return flatDistance(now.Position,point)<=7 and math.abs(now.Position.Y-point.Y)<15
+    end
+end
+]====],
+    ["hunting-room-route.lua"] = [====[local P={}
+function P.Room(zones,point)
+    for id,z in pairs(zones) do
+        if id:match("^Boss") and math.abs(point.X-z.X)<=z.SX/2+3 and math.abs(point.Z-z.Z)<=z.SZ/2+3
+            and math.abs((point.Y or z.Y)-z.Y)<40 then return id end
+    end
+end
+function P.Adjacent(map,room,direction)
+    local order=map[room] and map[room].Order
+    if not order then return nil end
+    local best,gap=nil,math.huge
+    for id,zone in pairs(map) do
+        if id:match("^Field") then
+            local delta=((zone.Order or 0)-order)*direction
+            if delta>0 and delta<gap then best,gap=id,delta end
+        end
+    end
+    return best
+end
+function P.Stage(zones,field,room)
+    local z,boss=zones[field],zones[room]
+    if not z or not boss then return nil end
+    local sign=boss.Z<z.Z and -1 or 1
+    return {X=z.X,Y=z.Y+5,Z=z.Z+sign*(z.SZ/2-15)}
+end
+return P
+]====],
+    ["hunting-room-travel.lua"] = [====[return function(ctx)
+    local s,p=ctx.State,ctx.Player
+    local policy=assert(loadstring(readfile("hunting-room-route.lua")))()
+    local map=require(game.ReplicatedStorage.Shared.MapData)
+    local function crowded(room)
+        local party={[p.UserId]=true}
+        for _,entry in ipairs(ctx.Json("PartyJson").Members or {}) do party[tonumber(entry.UserId) or 0]=true end
+        local zones=ctx.Nav().Zones or {}
+        for _,other in ipairs(game.Players:GetPlayers()) do
+            local root=other.Character and other.Character:FindFirstChild("HumanoidRootPart")
+            if not party[other.UserId] and root and policy.Room(zones,root.Position)==room then return true end
+        end
+        return false
+    end
+    s.BossTravel=function(destination,token)
+        local _,_,root=ctx.Character()
+        local target=destination()
+        if not root or not target then return true,false end
+        local zones=ctx.Nav().Zones or {}
+        local sourceRoom,targetRoom=policy.Room(zones,root.Position),policy.Room(zones,target)
+        local fromCrowded=sourceRoom and crowded(sourceRoom)
+        local toCrowded=targetRoom and crowded(targetRoom)
+        local distant=targetRoom and Vector2.new(root.Position.X-target.X,root.Position.Z-target.Z).Magnitude>180
+        if not fromCrowded and not toCrowded and not distant then return false end
+        local function vector(point) return point and Vector3.new(point.X,point.Y,point.Z) end
+        s.InBossRoute=true
+        local ok,result=pcall(function()
+            ctx.SetAuto(false)
+            if sourceRoom and sourceRoom~=targetRoom and fromCrowded then
+                local direction=target.Z<zones[sourceRoom].Z and 1 or -1
+                local field=policy.Adjacent(map,sourceRoom,direction)
+                if not field or (s.CanEnterZone and not s.CanEnterZone(field)) then field=policy.Adjacent(map,sourceRoom,-1) end
+                local exit=vector(policy.Stage(zones,field,sourceRoom))
+                if not exit then return false end
+                ctx.Status("Walking out of boss room before travel")
+                if not s.WalkTo(exit,token,{Timeout=30}) then return false end
+            end
+            target=destination()
+            if not target then return false end
+            targetRoom=policy.Room(zones,target)
+            if targetRoom then
+                local _,_,current=ctx.Character()
+                if not current then return false end
+                if policy.Room(zones,current.Position)~=targetRoom then
+                    local field=policy.Adjacent(map,targetRoom,-1)
+                    local stage=vector(policy.Stage(zones,field,targetRoom))
+                    if not stage then return false end
+                    if Vector2.new(current.Position.X-stage.X,current.Position.Z-stage.Z).Magnitude>20 then
+                        ctx.Status("Traveling to the field beside boss entrance")
+                        if not ctx.MoveTo(stage,token) then return false end
+                    end
+                end
+                local expectedRoom=targetRoom
+                target=destination()
+                if not target or policy.Room(zones,target)~=expectedRoom then return false end
+                ctx.Status("Walking through boss entrance")
+                local walked=s.WalkTo(target,token,{Timeout=30,Cancel=function()
+                    local latest=destination()
+                    return not latest or policy.Room(zones,latest)~=expectedRoom
+                end})
+                s.LastTravel={Outcome=walked and "walked into boss room" or "waiting for boss doorway",Follow=true,Target=tostring(target),Room=expectedRoom}
+                return walked
+            end
+            return ctx.MoveTo(target,token)
+        end)
+        s.InBossRoute=false
+        if not ok then error(result,0) end
+        return true,result
+    end
+end
+]====],
+    ["hunting-party-policy.lua"] = [====[local P={}
+function P.Trusted(registry,id,now,present)
+    return registry~=nil and now-(registry.At or -math.huge)<12 and present==true
+        and registry.Members[id]~=nil
+end
+function P.CanReceive(registry,id,now,present,kind,ownId,party)
+    if not P.Trusted(registry,id,now,present) then return false end
+    if kind=="request" then return tonumber(party.Leader)==ownId end
+    if registry.Captain~=id then return false end
+    for _,m in ipairs(party.Members or {}) do if tonumber(m.UserId)~=ownId then return false end end
+    return true
+end
+return P
+]====],
+    ["hunting-party-online.lua"] = [====[return function(ctx,options)
+    local s,p,r,http=ctx.State,ctx.Player,ctx.Remotes,ctx.Http
+    local players=game:GetService("Players")
+    local policy=assert(loadstring(readfile("hunting-party-policy.lua")))()
+    local endpoint="https://hunting-party-registry-ohm675.lionkoong01.chatgpt.site/api/heartbeat"
+    local path="hunting-helper-group.json"
+    local function code(value) return type(value)=="string" and value:gsub("[%s%-]",""):lower() or "" end
+    local function valid(value) return #value==32 and value:match("^[a-f0-9]+$")~=nil end
+    local saved
+    pcall(function() saved=http:JSONDecode(readfile(path)).Code end)
+    s.GroupCode=valid(code(saved)) and code(saved) or http:GenerateGUID(false):gsub("%-",""):lower()
+    local session=http:GenerateGUID(false):gsub("%-",""):lower()
+    local function persist() return pcall(function() writefile(path,http:JSONEncode({Code=s.GroupCode})) end) end
+    persist()
+    s.SetGroupCode=function(value)
+        local clean=code(value)
+        if not valid(clean) then s.RegistryStatus="รหัสกลุ่มต้องเป็นรหัส 32 ตัวที่คัดลอกจากอีกจอ"; return false end
+        s.GroupCode=clean; s.Registry=nil; s.RegistryStatus="กำลังเชื่อมต่อกลุ่มใหม่"
+        return persist()
+    end
+    s.NewGroupCode=function() return s.SetGroupCode(http:GenerateGUID(false):gsub("%-","")) end
+    s.CopyGroupCode=function()
+        if type(setclipboard)=="function" then pcall(setclipboard,s.GroupCode); return true end
+        return false
+    end
+    local function requestFn()
+        if type(request)=="function" then return request end
+        if type(http_request)=="function" then return http_request end
+        if type(syn)=="table" and type(syn.request)=="function" then return syn.request end
+    end
+    local function refresh()
+        if not options.AutoParty then s.Registry=nil; s.RegistryStatus="ปาร์ตี้อัตโนมัติปิดอยู่"; return end
+        local send=requestFn()
+        if not send then s.Registry=nil; s.RegistryStatus="Executor ไม่มี HTTP request สำหรับปาร์ตี้ข้ามเครื่อง"; return end
+        local party=ctx.Json("PartyJson")
+        local ids={}
+        for _,entry in ipairs(party.Members or {}) do ids[#ids+1]=tonumber(entry.UserId) end
+        local group=s.GroupCode
+        local ok,response=pcall(send,{Url=endpoint,Method="POST",Headers={
+            ["Content-Type"]="application/json",Authorization="Bearer "..group},Body=http:JSONEncode({
+                userId=p.UserId,gameId=game.GameId,jobId=game.JobId,sessionId=session,
+                level=tonumber(p:GetAttribute("Level")) or 1,job=p:GetAttribute("Job") or "Unknown",
+                party=ids,partyLeader=tonumber(party.Leader) or 0})})
+        if s.Destroyed or group~=s.GroupCode or not options.AutoParty then return end
+        if not ok or type(response)~="table" or tonumber(response.StatusCode)~=200 then
+            s.Registry=nil; s.RegistryStatus="เชื่อมต่อกลุ่มไม่ได้ • พักการเชิญและรับปาร์ตี้"; return
+        end
+        local decodedOk,data=pcall(function() return http:JSONDecode(response.Body) end)
+        if not decodedOk or type(data.members)~="table" or type(data.captain)~="number" then
+            s.Registry=nil; s.RegistryStatus="ข้อมูลกลุ่มไม่สมบูรณ์"; return
+        end
+        local members,count={},0
+        for _,m in ipairs(data.members) do
+            if type(m.userId)=="number" and players:GetPlayerByUserId(m.userId) then members[m.userId]=m; count+=1 end
+        end
+        s.Registry={Members=members,Captain=data.captain,At=os.clock(),Count=count}
+        s.RegistryStatus="ออนไลน์กลุ่มเดียวกัน "..count.." คน • เชิญ/รับเฉพาะคนในกลุ่ม"
+    end
+    local function trusted(id)
+        return options.AutoParty and policy.Trusted(s.Registry,id,os.clock(),players:GetPlayerByUserId(id)~=nil)
+    end
+    s.IsScriptPeer=trusted
+    local lastAction={}
+    s.PartyActions={}
+    table.insert(s.Connections,r.Notify.OnClientEvent:Connect(function(message)
+        s.LastPartyNotice=tostring(message)
+    end))
+    local function send(action,id)
+        local key=action..tostring(id)
+        if os.clock()-(lastAction[key] or -math.huge)<8 then return end
+        lastAction[key]=os.clock()
+        s.PartyActions[#s.PartyActions+1]={Action=action,Id=id,At=os.clock()}
+        while #s.PartyActions>25 do table.remove(s.PartyActions,1) end
+        if id==nil then r.PartyAction:FireServer(action) else r.PartyAction:FireServer(action,id) end
+    end
+    table.insert(s.Connections,r.PartyInvite.OnClientEvent:Connect(function(senderId,_,_,kind)
+        senderId=tonumber(senderId)
+        if not options.AutoParty or not senderId then return end
+        local party=ctx.Json("PartyJson")
+        if not policy.CanReceive(s.Registry,senderId,os.clock(),players:GetPlayerByUserId(senderId)~=nil,kind,p.UserId,party) then
+            send(kind=="request" and "reqdecline" or "decline",senderId); return
+        end
+        if kind=="request" then send("reqaccept",senderId)
+        else
+            if #(party.Members or {})==1 and tonumber(party.Leader)==p.UserId then send("leave") end
+            send("accept",senderId)
+        end
+    end))
+    local function formParty()
+        local registry=s.Registry
+        if not trusted(p.UserId) or registry.Captain~=p.UserId then return end
+        local party=ctx.Json("PartyJson")
+        local existing={}
+        for _,m in ipairs(party.Members or {}) do
+            local id=tonumber(m.UserId)
+            if not trusted(id) then s.RegistryStatus="มีสมาชิกที่ไม่ได้ยืนยันกลุ่ม • พักการเชิญเพิ่ม"; return end
+            existing[id]=true
+        end
+        if next(existing)==nil then send("create"); return end
+        if tonumber(party.Leader)~=p.UserId then return end
+        for id in pairs(registry.Members) do if id~=p.UserId and not existing[id] and trusted(id) then send("invite",id) end end
+    end
+    task.spawn(function()
+        while not s.Destroyed do
+            local ok=pcall(refresh)
+            if not ok then s.Registry=nil; s.RegistryStatus="เชื่อมต่อกลุ่มผิดพลาด • พักการเชิญ" end
+            if not s.Destroyed then
+                local formed,err=pcall(formParty)
+                if not formed then s.PartyError=tostring(err); s.RegistryStatus="ปาร์ตี้ผิดพลาด: "..tostring(err):sub(-100) end
+            end
+            task.wait(4)
+        end
+    end)
+end
+]====],
+    ["hunting-boxes.lua"] = [====[return function(ctx,options)
+    local s,p,r=ctx.State,ctx.Player,ctx.Remotes
+    local tags=game:GetService("CollectionService")
+    local policy=assert(loadstring(readfile("hunting-box-policy.lua")))()
+    local boxData=require(game.ReplicatedStorage.Shared.LootBoxData)
+    local originalNative=ctx.Json("SettingsJson").AutoOpenBox
+    local pending,boxError=nil,nil
+    local used=setmetatable({},{__mode="k"})
+    local blocked=setmetatable({},{__mode="k"})
+    local function status(value) s.BoxStatus=value end
+    local function suppress()
+        if not options.SmartBoxes then return end
+        local settings=ctx.Json("SettingsJson")
+        if settings.AutoOpenBox~=false then settings.AutoOpenBox=false; r.SetSettings:FireServer(settings) end
+    end
+    local function anchor()
+        local a=s.FarmSpot
+        local zone=a and (ctx.Nav().Zones or {})[a.Zone]
+        return zone and Vector3.new(a.X,zone.Y+5,a.Z),a and a.Radius or options.FarmRadius
+    end
+    local function enemies(point,radius)
+        local result={}
+        local folder=workspace:FindFirstChild("Monsters")
+        for _,model in ipairs(folder and folder:GetChildren() or {}) do
+            local root=model:IsA("Model") and model.PrimaryPart
+            local id=tostring(model:GetAttribute("MonsterId") or "")
+            local def=ctx.Monsters[id] or {}
+            local danger=model:GetAttribute("IsMiniBoss")==true or def.MiniBoss==true
+                or id:lower():find("spider",1,true) or id:find("halloween_pumpkin",1,true)
+                or model.Name:lower():find("spider",1,true)
+            if root and danger and (tonumber(model:GetAttribute("HP")) or 0)>0
+                and policy.Inside(root.Position,point,radius+45) then result[#result+1]=model end
+        end
+        return result
+    end
+    local function resolve(live)
+        if not pending then return end
+        local title=tostring(pending.Box:GetAttribute("OpenTitle") or ""):upper()
+        local buff=false
+        for _,definition in pairs(boxData.Buffs or {}) do
+            if type(definition.Name)=="string" and title:find(definition.Name:upper(),1,true) then buff=true end
+        end
+        local spawned
+        for _,model in ipairs(live) do
+            if not pending.Before[model] and (model.PrimaryPart.Position-pending.Point).Magnitude<30 then spawned=model; break end
+        end
+        if buff or spawned then
+            s.LastBoxResult=buff and title or tostring(spawned:GetAttribute("MonsterId"))
+            pending=nil; s.BoxPending=false
+        elseif os.clock()-pending.At>8 then
+            boxError="ไม่เห็นผลกล่อง • พักเปิดเพิ่ม กรุณาตรวจแล้วกดลองใหม่"
+        end
+    end
+    local function opener(plan)
+        if not plan.IsLeader then return false end
+        if not options.AutoParty then return true end
+        if not s.IsScriptPeer or not s.IsScriptPeer(p.UserId) then return false end
+        local list={}
+        for id,m in pairs(s.Registry.Members) do
+            list[#list+1]={Id=id,Level=m.level,Job=m.job,Present=true}
+        end
+        return s.Policy.Team(list,s.Registry.Captain).LeaderId==p.UserId
+    end
+    local function ready(plan,count)
+        return policy.Ready({Enabled=options.SmartBoxes,Leader=opener(plan),GroupReady=plan.GroupReady,
+            Error=boxError,Pending=pending and 1 or 0,Enemies=count})
+    end
+    local function selectBox(home,radius,root,plan)
+        local selected,nearest
+        local members={[p.UserId]=true}
+        for _,member in ipairs(plan.Members) do members[member.Id]=true end
+        for _,box in ipairs(tags:GetTagged("LootBox")) do
+            if box:IsA("BasePart") and box.Parent and not used[box] and not box:GetAttribute("OpenTitle")
+                and (blocked[box] or 0)<os.clock() and policy.Inside(box.Position,home,radius) then
+                local now=workspace:GetServerTimeNow()
+                local owner=tonumber(box:GetAttribute("OwnerUserId")) or 0
+                local free=(tonumber(box:GetAttribute("FreeAt")) or math.huge)<=now
+                local expiry=(tonumber(box:GetAttribute("SpawnedAt")) or now)+60
+                local distance=(box.Position-root.Position).Magnitude
+                if (owner==0 or members[owner] or free) and expiry-now>3 and (not nearest or distance<nearest) then selected,nearest=box,distance end
+            end
+        end
+        return selected
+    end
+    local function trigger(box,live,token)
+        local _,_,root=ctx.Character()
+        local prompt=box:FindFirstChildWhichIsA("ProximityPrompt",true)
+        local distance=root and (root.Position-box.Position).Magnitude or math.huge
+        -- The UI prompt can be visible farther away than the server allows opening.
+        local allowed=prompt and math.min(6,math.max(1,prompt.MaxActivationDistance-1)) or 0
+        if not prompt or not prompt.Enabled or distance>allowed then blocked[box]=os.clock()+2; return end
+        local before={}; for _,model in ipairs(live) do before[model]=true end
+        pending={Box=box,At=os.clock(),Before=before,Point=box.Position}
+        used[box]=true; s.BoxPending=true; s.LastBoxTrigger="prompt"
+        s.BoxesOpened=(s.BoxesOpened or 0)+1
+        -- Reserve the potential enemy before the request; never blindly resend it.
+        if type(fireproximityprompt)=="function" then fireproximityprompt(prompt)
+        else
+            prompt:InputHoldBegin()
+            ctx.Sleep(math.max(0.05,prompt.HoldDuration+0.05),token)
+            prompt:InputHoldEnd()
+        end
+    end
+    local function step(token)
+        suppress()
+        local home,radius=anchor()
+        if not home then return end
+        local live=enemies(home,radius)
+        resolve(live)
+        s.BoxEnemyCount=#live; s.BoxReserved=pending and 1 or 0
+        s.LuckyRemaining=math.max(0,math.ceil((s.LuckyUntil and s.LuckyUntil() or 0)-workspace:GetServerTimeNow()))
+        local plan=s.GetTeamPlan()
+        local decision=ready(plan,#live)
+        if decision~="ready" then status(boxError or decision); return end
+        if not s.Zone or s.Zone~=s.FarmSpot.Zone or s.Traveling or s.Looting
+            or s.BossActive or s.InventoryBusy or s.ForceSell or s.ForceEquip or os.clock()<(s.DodgeUntil or 0) then return end
+        local _,h,root=ctx.Character()
+        if not root or h.Health/h.MaxHealth<0.3 then return end
+        local box=selectBox(home,radius,root,plan)
+        if not box then status("รอกล่องในวงฟาร์ม • ศัตรู "..#live.."/3"); return end
+        local prompt=box:FindFirstChildWhichIsA("ProximityPrompt",true)
+        local reach=prompt and math.min(6,math.max(1,prompt.MaxActivationDistance-1)) or 6
+        local distance=(root.Position-box.Position).Magnitude
+        if distance<=reach then trigger(box,live,token); status("เปิดต่อ • ไม่รอ Lucky Drop • ศัตรู "..#live.."/3"); return end
+        s.BoxBusy=true
+        local zone=s.Zone
+        local walked=false
+        local ok,err=pcall(function()
+            ctx.SetAuto(false)
+            local point=Vector3.new(box.Position.X,home.Y,box.Position.Z)
+            status("เดินไปเปิดกล่องในวงเดิม")
+            walked=true
+            local reached=s.WalkTo(point,token,{Anchor=home,Radius=radius,Timeout=12,Cancel=function()
+                return not box.Parent or box:GetAttribute("OpenTitle")~=nil or not options.SmartBoxes
+                    or #enemies(home,radius)>=3 or s.Zone~=zone
+            end})
+            if reached and box.Parent and ready(s.GetTeamPlan(),#enemies(home,radius))=="ready" then trigger(box,enemies(home,radius),token)
+            else blocked[box]=os.clock()+4 end
+            if s.Active and s.Generation==token then
+                status("เดินกลับจุดยืนเดิม")
+                if s.WalkTo(home,token,{Anchor=home,Radius=radius,Timeout=12}) then ctx.SetAuto(true)
+                else s.Zone=nil end
+            end
+        end)
+        s.BoxBusy=false
+        if not ok then
+            if walked then s.Zone=nil end
+            error(err,0)
+        end
+    end
+    s.ShouldHuntBoss=function()
+        local plan=s.GetTeamPlan()
+        return plan.IsLeader and plan.GroupReady and not pending and not s.BoxBusy and (s.BoxEnemyCount or 0)==0
+    end
+    s.BoxController=nil -- A dedicated worker checks every 0.1s, including while farming.
+    s.BoxCancel=function()
+        -- Keep reservations across pause/resume: stopping does not undo a sent request.
+        if pending then boxError="หยุดระหว่างรอผลกล่อง • ตรวจศัตรูก่อนกดลองใหม่" end
+    end
+    s.ResetBoxPause=function()
+        if pending and os.clock()-pending.At<8 then return end
+        pending=nil; boxError=nil; s.BoxPending=false
+    end
+    local restore=s.CleanupExtra
+    s.CleanupExtra=function()
+        if restore then restore() end
+        if originalNative~=nil then
+            local settings=ctx.Json("SettingsJson"); settings.AutoOpenBox=originalNative
+            pcall(function() r.SetSettings:FireServer(settings) end)
+        end
+    end
+    task.spawn(function()
+        while not s.Destroyed do
+            if s.Active then
+                local token=s.Generation
+                local ok=pcall(step,token)
+                if not ok and s.Active and s.Generation==token then
+                    boxError="เปิดกล่องผิดพลาด • พักเปิดเพิ่ม กรุณาตรวจแล้วกดลองใหม่"
+                    s.BoxBusy=false
+                end
+            end
+            task.wait(0.1)
+        end
+    end)
+    -- Observe outcomes even while the opening worker is walking home. A party
+    -- can kill a newly spawned enemy before that walk has finished.
+    task.spawn(function()
+        while not s.Destroyed do
+            if pending then
+                pcall(function()
+                    local home,radius=anchor()
+                    if home then
+                        local live=enemies(home,radius)
+                        resolve(live)
+                        s.BoxEnemyCount=#live; s.BoxReserved=pending and 1 or 0
+                    end
+                end)
+            end
+            task.wait(0.1)
+        end
+    end)
+end
+]====],
+    ["hunting-box-policy.lua"] = [====[local P={}
+function P.Inside(point,anchor,radius)
+    return (point.X-anchor.X)^2+(point.Z-anchor.Z)^2<=(radius or 40)^2
+        and math.abs((point.Y or 0)-(anchor.Y or 0))<20
+end
+function P.Capacity(enemies,pending) return math.max(0,3-enemies-pending) end
+function P.Ready(state)
+    if not state.Enabled then return "off" end
+    if not state.Leader then return "single_opener" end
+    if not state.GroupReady then return "party_wait" end
+    if state.Error then return "paused_unknown_result" end
+    if state.Pending>0 then return "await_result" end
+    if P.Capacity(state.Enemies,state.Pending)<=0 then return "enemy_limit_3" end
+    return "ready"
+end
+return P
 ]====]
 }
 local nativeLoadstring, nativeReadfile = loadstring, readfile
