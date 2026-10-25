@@ -78,6 +78,7 @@ local function saveStatus()
         local _, _, r = character()
         writefile("hunting-helper-status.json", Http:JSONEncode({
             Active = state.Active, Status = state.Status, Zone = state.Zone,
+            JobId=game.JobId,
             Sold = state.Sold, Level = player:GetAttribute("Level"),
             BagUsed = player:GetAttribute("BagSlotsUsed"),
             BagMax = player:GetAttribute("BagSlotsMax"),
@@ -258,6 +259,21 @@ local function moveTo(point, token)
         status("Waiting to regroup with party leader")
         sleep(1,token)
         return false
+    end
+    if not arrived and state.WalkTo and not state.BossActive then
+        for id,z in pairs(nav().Zones or {}) do
+            if id:match("^Field") and math.abs(target.X-z.X)<=z.SX/2 and math.abs(target.Z-z.Z)<=z.SZ/2
+                and math.abs(target.Y-z.Y)<45 and inZone(current,{Id=id}) then
+                status("Walking from field entrance to the farm point")
+                if state.WalkTo(target,token,{Timeout=20}) then
+                    arrived=true
+                    local _,_,walked=character()
+                    state.LastTravel.After=walked and tostring(walked.Position)
+                    state.LastTravel.Outcome="walked from field entrance"
+                end
+                break
+            end
+        end
     end
     assert(arrived,"Travel was rejected; paused")
     return true
@@ -1671,14 +1687,14 @@ return S
     local rulesCard=card(gear,126)
     text(rulesCard,"ดาบ / มีด: CRIT    ธนู: CRIT หรือ ASPD\nคทา: CRIT หรือ %MATK    สมุด: ลดคูลดาวน์\nขวาน: CRIT หรือ AGI\nแหวน: CRIT / ASPD / ความเร็วร่าย\nของที่ใส่อยู่หรือล็อกไว้จะไม่ถูกขาย",12,8,440,110,12,C.Muted)
     local servers=page("Server")
-    local hopStatusCard=card(servers,76)
-    local hopStatus=text(hopStatusCard,"",12,8,440,60,13,C.Accent)
+    local hopStatusCard=card(servers,52)
+    local hopStatus=text(hopStatusCard,"",12,6,440,40,13,C.Accent)
     optionCheck(servers,"HopTogether","แบบปาร์ตี้ • จอนี้ออกสำรวจก่อน","สมาชิกอื่นฟาร์มรอเซิร์ฟเดิม • เจอเงื่อนไขจึงเรียกตาม")
-    optionCheck(servers,"FollowGroupHop","ตามเมื่อจอสำรวจเรียกทีม","เฉพาะรหัสกลุ่มตรงกันและรายชื่อทีมตอนเริ่มสำรวจ")
-    local hopActions=card(servers,146)
-    button(hopActions,"Hop • เซิร์ฟคนน้อย",12,10,440,34,function() s.RequestHop("Population") end,true)
-    button(hopActions,"หาเซิร์ฟที่คนส่วนใหญ่เลเวลต่ำกว่าทีม",12,54,440,34,function() s.RequestHop("LowerLevels") end)
-    button(hopActions,"หาเซิร์ฟที่บอสทั้ง 5 ยังมีชีวิต",12,98,440,34,function() s.RequestHop("Boss5") end)
+    local hopActions=card(servers,112)
+    button(hopActions,"Hop • เซิร์ฟคนน้อย",12,8,440,28,function() s.RequestHop("Population") end,true)
+    button(hopActions,"หาเซิร์ฟที่คนส่วนใหญ่เลเวลต่ำกว่าทีม",12,42,440,28,function() s.RequestHop("LowerLevels") end)
+    button(hopActions,"หาเซิร์ฟที่บอสทั้ง 5 ยังมีชีวิต",12,76,440,28,function() s.RequestHop("Boss5") end)
+    optionCheck(servers,"FollowGroupHop","ตามเมื่อจอสำรวจเรียกทีม","เฉพาะรหัสกลุ่มตรงกัน • รวมจอที่ลงทะเบียนตามมาจากเซิร์ฟเดิม")
     selectRow(servers,"HopMaxAttempts","จำนวนเซิร์ฟที่ยอมลอง • เว้นอย่างน้อย 30 วินาที",{1,3,5,10})
     local hopControls=card(servers,88)
     button(hopControls,"ดูรายชื่อ • ยังไม่ย้าย",12,10,215,30,function() s.PreviewServers() end)
@@ -2545,7 +2561,7 @@ return P
     s.SetGroupCode=function(value)
         local clean=code(value)
         if not valid(clean) then s.RegistryStatus="รหัสกลุ่มต้องเป็นรหัส 32 ตัวที่คัดลอกจากอีกจอ"; return false end
-        s.GroupCode=clean; s.Registry=nil; s.GroupTrip=nil; s.ServerReports={}; s.RegistryStatus="กำลังเชื่อมต่อกลุ่มใหม่"
+        s.GroupCode=clean; s.Registry=nil; s.GroupTrip=nil; s.LastGroupTrip=nil; s.ServerReports={}; s.RegistryStatus="กำลังเชื่อมต่อกลุ่มใหม่"
         return persist()
     end
     s.NewGroupCode=function() return s.SetGroupCode(http:GenerateGUID(false):gsub("%-","")) end
@@ -2593,8 +2609,15 @@ return P
         if group~=s.GroupCode or s.Destroyed then return nil,"กลุ่มเปลี่ยนแล้ว" end
         local decoded,data=pcall(function() return http:JSONDecode(response.Body) end)
         if not decoded or type(data)~="table" then return nil,"ข้อมูลสำรวจทีมไม่สมบูรณ์" end
-        if tonumber(response.StatusCode)~=200 or not data.trip then return nil,tostring(data.error or response.StatusCode) end
+        if tonumber(response.StatusCode)~=200 or not data.trip then
+            local messages={register_first="รอเชื่อมกลุ่มอีกสักครู่",update_all_clients_first="โหลดสคริปต์รุ่นใหม่ให้ครบทุกจอก่อน",
+                scout_already_running="มีจอสำรวจอยู่แล้ว • หยุดจอเดิมก่อน",party_still_arriving="รอทีมตามมาครบก่อนค้นหาใหม่",
+                scout_only="ให้จอที่เริ่มสำรวจเป็นผู้เรียกทีม",trip_changed_retry="ข้อมูลทีมเพิ่งเปลี่ยน • ลองใหม่อีกครั้ง",
+                party_limit_6="กลุ่มนี้เกินจำนวนสมาชิกปาร์ตี้ 6 คน",storage_error="บริการกลุ่มยังไม่พร้อม • ลองอีกครั้ง"}
+            return nil,messages[data.error] or ("บริการกลุ่มตอบกลับ "..tostring(response.StatusCode))
+        end
         s.GroupTrip=data.trip
+        s.LastGroupTrip=data.trip
         return data.trip
     end
     local function refresh()
@@ -2627,6 +2650,7 @@ return P
         s.Registry={Members=members,Captain=data.captain,At=os.clock(),Count=count}
         s.ServerReports=type(data.reports)=="table" and data.reports or {}
         s.GroupTrip=type(data.trip)=="table" and data.trip or nil
+        if type(data.lastTrip)=="table" then s.LastGroupTrip=data.lastTrip end
         s.RegistryStatus="ออนไลน์กลุ่มเดียวกัน "..count.." คน • เชิญ/รับเฉพาะคนในกลุ่ม"
     end
     local function trusted(id)
@@ -2662,6 +2686,7 @@ return P
     local function formParty()
         local registry=s.Registry
         if not trusted(p.UserId) or registry.Captain~=p.UserId then return end
+        if registry.Count<2 then return end
         local party=ctx.Json("PartyJson")
         local existing={}
         for _,m in ipairs(party.Members or {}) do
@@ -2677,11 +2702,14 @@ return P
         while not s.Destroyed do
             local ok=pcall(refresh)
             if not ok then s.Registry=nil; s.RegistryStatus="เชื่อมต่อกลุ่มผิดพลาด • พักการเชิญ" end
-            if not s.Destroyed then
-                local formed,err=pcall(formParty)
-                if not formed then s.PartyError=tostring(err); s.RegistryStatus="ปาร์ตี้ผิดพลาด: "..tostring(err):sub(-100) end
-            end
             task.wait(4)
+        end
+    end)
+    task.spawn(function()
+        while not s.Destroyed do
+            local formed,err=pcall(formParty)
+            if not formed then s.PartyError=tostring(err); s.RegistryStatus="ปาร์ตี้ผิดพลาด: "..tostring(err):sub(-100) end
+            task.wait(0.5)
         end
     end)
 end
@@ -2986,6 +3014,20 @@ return P
     local policy=assert(loadstring(readfile("hunting-hop-policy.lua")))()
     local path="hunting-helper-hop-"..p.UserId..".json"
     local function now() return workspace:GetServerTimeNow() end
+    local function busy()
+        local active=s.BossActive
+        if active and active.Id=="party_boss" and s.GetTeamPlan then
+            local plan=s.GetTeamPlan()
+            local leader=plan.Leader
+            local root=leader and leader.Character and leader.Character:FindFirstChild("HumanoidRootPart")
+            local zone=ctx.Nav and (ctx.Nav().Zones or {})[active.Room]
+            -- A follower marker must not keep waiters stuck after the scout
+            -- left the server or the old party leader left the boss room.
+            if plan.IsLeader or not root or not zone or math.abs(root.Position.X-zone.X)>zone.SX/2+8
+                or math.abs(root.Position.Z-zone.Z)>zone.SZ/2+8 then s.BossActive=nil end
+        end
+        return policy.Busy(s)
+    end
     local queue=type(queue_on_teleport)=="function" and queue_on_teleport
         or (type(queueonteleport)=="function" and queueonteleport)
         or (type(syn)=="table" and syn.queue_on_teleport)
@@ -3002,10 +3044,11 @@ return P
     local function status(value) s.HopStatus=value end
     local function persist()
         visited=policy.CleanVisited(visited,now()); seen=policy.CleanVisited(seen,now())
-        pcall(function() writefile(path,http:JSONEncode({Visited=visited,Seen=seen,Search=search,Rally=rally})) end)
+        pcall(function() writefile(path,http:JSONEncode({Visited=visited,Seen=seen,Search=search,Rally=rally,LastTrip=s.LastGroupTrip})) end)
         s.HopSearch=search and {Mode=search.Mode,Attempts=search.Attempts,Limit=search.Limit,Together=search.Together} or nil
     end
     local old=saved.Search
+    if type(saved.LastTrip)=="table" and saved.LastTrip.scout==p.UserId then s.LastGroupTrip=saved.LastTrip end
     if type(old)=="table" and policy.Mode(old.Mode) and type(old.Deadline)=="number" and old.Deadline>now()
         and old.Deadline<now()+1800 and old.Group==s.GroupCode and type(old.Attempts)=="number"
         and type(old.Limit)=="number" and old.Limit>=1 and old.Limit<=10 and old.Attempts>=0 and old.Attempts<=old.Limit
@@ -3099,6 +3142,7 @@ return P
             search={Mode=mode,Together=together,TripId=trip and trip.id,Members=trip and trip.members or {p.UserId},
                 Attempts=0,Limit=mode=="Population" and 1 or options.HopMaxAttempts,Deadline=now()+600,
                 Origin=game.JobId,Group=s.GroupCode,Level=s.GetFarmLevel(),NextAt=now()}
+            search.Slots=math.max(#search.Members,#(ctx.Json("PartyJson").Members or {}))
             fetching=false; s.HopHold=true; persist()
             status(together and "จอนี้ออกสำรวจ • สมาชิกอื่นรอเซิร์ฟเดิม" or "เตรียมย้ายเฉพาะจอนี้")
         end)
@@ -3113,7 +3157,7 @@ return P
         if orphan then task.spawn(function() s.PostGroupTrip("cancel",{tripId=incoming.id}) end) end
     end
     s.CallTeamHere=function()
-        local trip=s.GroupTrip
+        local trip=s.GroupTrip or s.LastGroupTrip
         if fetching or not trip or trip.scout~=p.UserId then status("จอที่สำรวจเป็นผู้เรียกทีมครับ"); return end
         fetching=true
         task.spawn(function()
@@ -3150,7 +3194,7 @@ if not ok then warn("Hunting Helper queued resume: "..tostring(err)) end
         if who==p and placeId==game.PlaceId then failed(tostring(message)) end
     end))
     local function depart(target)
-        if flight or policy.Busy(s) then status("รอสู้บอส/เก็บของ/เดินทางให้เสร็จก่อน Hop"); return false end
+        if flight or busy() then status("รอสู้บอส/เก็บของ/เดินทางให้เสร็จก่อน Hop"); return false end
         if not queued and type(queue)=="function" then
             local ok=pcall(queue,bootstrap)
             if not ok then rally=nil; finish("ตั้งรันต่อหลังย้ายไม่สำเร็จ • พักการย้าย",true); return false end
@@ -3187,7 +3231,7 @@ if not ok then warn("Hunting Helper queued resume: "..tostring(err)) end
             end
             if now()<(rally.NextAt or 0) then return end
             s.HopDeparting=true
-            if policy.Busy(s) then status("ทีมเรียกแล้ว • รอเก็บของ/สู้บอสให้เสร็จก่อนตาม"); return end
+            if busy() then status("ทีมเรียกแล้ว • รอเก็บของ/สู้บอสให้เสร็จก่อนตาม"); return end
             seen[rally.Trip.rallyId]=now()+21600
             depart(rally.Trip.target)
             return
@@ -3199,6 +3243,10 @@ if not ok then warn("Hunting Helper queued resume: "..tostring(err)) end
                     if not s.IsScriptPeer(id) then s.HopHold=true; status("รอทีมเข้าเซิร์ฟใหม่ครบก่อนล่าบอส/เปิดกล่อง"); break end
                 end
             end
+            if s.HopWaitingTeam and not s.HopHold then
+                status(trip and trip.phase=="rally" and "ทีมมาถึงครบแล้ว • ฟาร์มต่อ" or "คำเรียกทีมหมดเวลา • จอสำรวจกดเรียกทีมมาที่นี่ได้อีกครั้ง")
+            end
+            s.HopWaitingTeam=s.HopHold
             if trip and trip.phase=="scouting" and trip.scout~=p.UserId then status("อีกจอกำลังสำรวจ • ฟาร์มรอในเซิร์ฟเดิม") end
             return
         end
@@ -3226,14 +3274,14 @@ if not ok then warn("Hunting Helper queued resume: "..tostring(err)) end
         if (arrived or search.Mode=="Boss5") and matched==nil then finish("เกมยังไม่ส่งข้อมูลที่ต้องตรวจ • พักค้นหา",true); return end
         if search.Attempts>=search.Limit then finish("ลองครบ "..search.Limit.." เซิร์ฟแล้ว ยังไม่ตรงเงื่อนไข • หยุดค้นหา",true); return end
         if now()<(search.NextAt or 0) then status("รอช่วงพักก่อนสำรวจเซิร์ฟถัดไป"); return end
-        if policy.Busy(s) then status("รอจบบอส/เก็บของ ก่อนออกสำรวจ"); return end
+        if busy() then status("รอจบบอส/เก็บของ ก่อนออกสำรวจ"); return end
         local current=search
         fetching=true
-        local ok,list,err=pcall(candidates,current.Mode,current.Together and #current.Members or 1,current.Level)
+        local ok,list,err=pcall(candidates,current.Mode,current.Together and math.max(#current.Members,current.Slots or 0) or 1,current.Level)
         fetching=false
         if search~=current or s.Destroyed then return end
         if not ok or not list or #list==0 then finish("หาเซิร์ฟไม่ได้: "..tostring(err or (not ok and list) or "ไม่มีเซิร์ฟที่ว่างพอ"),true); return end
-        if policy.Busy(s) then status("รอจบงานปัจจุบันก่อนย้าย • ยังไม่นับเป็นการลอง"); return end
+        if busy() then status("รอจบงานปัจจุบันก่อนย้าย • ยังไม่นับเป็นการลอง"); return end
         s.HopCandidates=list
         current.Attempts+=1; current.LastSource=game.JobId; current.NextAt=now()+30
         persist(); depart(list[1].Id)
